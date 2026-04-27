@@ -290,16 +290,16 @@ llama_kv_cache::llama_kv_cache(
         !attn_rot_disable &&
         n_embd_head_k_all > 0 &&
         ggml_is_quantized(type_k) &&
-        hparams.n_embd_head_k() % 64 == 0;
+        n_embd_head_k_all % 64 == 0;
 
     attn_rot_v =
         !attn_rot_disable &&
         n_embd_head_v_all > 0 &&
         ggml_is_quantized(type_v) &&
-        hparams.n_embd_head_v() % 64 == 0;
+        n_embd_head_v_all % 64 == 0;
 
     LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
-    LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
+    LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_v_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
 
     // pre-compute the haramard matrices and keep them in host memory
     // TODO: in the future, we can make copies in the backend buffers to avoid host -> device transfers
