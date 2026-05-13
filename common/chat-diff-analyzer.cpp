@@ -119,11 +119,12 @@ static std::vector<std::function<void(const common_chat_template & tmpl, autopar
           if (tmpl.src.find("<SPECIAL_10>") != std::string::npos && tmpl.src.find("<SPECIAL_11>") != std::string::npos &&
               tmpl.src.find("<SPECIAL_12>") != std::string::npos && tmpl.src.find("<TOOL_RESPONSE>") != std::string::npos) {
 
-              analysis.tools.format.mode           = tool_format::JSON_NATIVE;
-              analysis.tools.format.section_start  = "";
-              analysis.tools.format.section_end    = "";
-              analysis.tools.format.per_call_start = "<TOOLCALL>";
-              analysis.tools.format.per_call_end   = "</TOOLCALL>";
+              analysis.tools.format.mode                = tool_format::JSON_NATIVE;
+              analysis.tools.format.section_start       = "";
+              analysis.tools.format.section_end         = "";
+              analysis.tools.format.per_call_start      = "<TOOLCALL>";
+              analysis.tools.format.per_call_end        = "</TOOLCALL>";
+              analysis.tools.format.tools_array_wrapped = true;
               analysis.content.mode                = content_mode::PLAIN;
               analysis.content.start               = "";
               analysis.content.end                 = "";
