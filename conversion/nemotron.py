@@ -169,6 +169,14 @@ class NemotronHModel(GraniteHybridModel):
             self.model_arch = gguf.MODEL_ARCH.NEMOTRON_H_MOE
             self.is_moe = True
 
+        # Some checkpoints (e.g. Nemotron-3-Ultra-550B) omit the layer count and
+        # only describe the layers through the per-layer block type list.
+        if not any(k in hparams for k in ("num_hidden_layers", "n_layers", "n_layer", "num_layers")):
+            block_types = hparams.get("layers_block_type") or hparams.get("hybrid_override_pattern")
+            if block_types is not None:
+                hparams["num_hidden_layers"] = len(block_types)
+                kwargs.setdefault("hparams", hparams)
+
         super().__init__(*args, **kwargs)
 
         # Save the top-level head_dim for later
