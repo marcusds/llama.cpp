@@ -818,33 +818,25 @@ static void dequantize_block_q4_0(const void * __restrict__ vx, dst_t * __restri
 }
 
 template<typename dst_t>
-static void dequantize_block_q4_0_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t nb32,
+static void dequantize_block_q4_0_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t k,
                                   const sycl::nd_item<3> &item_ct1) {
-
-    const int64_t i = item_ct1.get_group(2);
-    auto k=nb32;
-    // assume 32 threads
-    const int64_t tid = item_ct1.get_local_id(2);
-    const int lane_ib = i * WARP_SIZE + tid;
-
-    if (lane_ib >= k / QK4_0) {
+    // One thread per qs byte (two values), like dequantize_block<dequantize_q4_0>: in the reorder layout the
+    // qs bytes are contiguous across blocks, so consecutive threads read consecutive bytes and write
+    // consecutive outputs.
+    const int64_t iq = item_ct1.get_global_id(2);
+    if (iq >= k / 2) {
         return;
     }
 
-    dst_t * y_ptr = yy + lane_ib * QK4_0;
+    const int64_t ib  = iq / (QK4_0/2);
+    const int64_t iqs = iq % (QK4_0/2);
 
-    auto qs = (const uint8_t*)vx + lane_ib * QK4_0 / 2;
-    auto s_ptr = (const sycl::half*)((const uint8_t*)vx + k / 2) + lane_ib;
+    const int     vq = ((const uint8_t *) vx)[iq];
+    const float   d  = float(((const sycl::half *) ((const uint8_t *) vx + k/2))[ib]);
 
-    const float d = float(*s_ptr);
-
-#pragma unroll
-    for (int l = 0; l < QK4_0 / 2; ++l) {
-        int vq = qs[l];
-        y_ptr[l + 0] = d * ((vq & 0xF) - 8);
-        y_ptr[l + 16] = d * ((vq >> 4) - 8);
-    }
-
+    dst_t * y = yy + ib*QK4_0 + iqs;
+    y[0]       = d * ((vq & 0xF) - 8);
+    y[QK4_0/2] = d * ((vq >>  4) - 8);
 }
 
 // Dequantize Q8_0 from reorder layout: [all qs (k bytes)][all d values]
