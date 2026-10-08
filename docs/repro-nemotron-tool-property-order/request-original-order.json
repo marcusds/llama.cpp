@@ -1,0 +1,475 @@
+{
+ "model": "nemotron3-super-120b",
+ "messages": [
+  {
+   "role": "system",
+   "content": "Call the tool with a valid job request."
+  },
+  {
+   "role": "user",
+   "content": "Generate 24 questions. Model: alias \"question-model\", model nemotron3-super-120b, provider default/local, max_tokens 4096.\nColumns, in this order:\n- category: category sampler with values assess, plan, propose\n- persona: category sampler with values \"terse plant manager\", \"careful new planner\", \"rushed scheduler typing on a phone\"\n- proposal_kind: category sampler with values within_max, over_max\n- proposed_units: expression, dtype int, expr 0 (placeholder, edited later)\n- question: llm-text using question-model, prompt: Write one short question as a {{ persona }}.\n- expected_answer: expression, dtype str, expr pending (placeholder, edited later)"
+  }
+ ],
+ "temperature": 1.0,
+ "stream": false,
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "generate_data_designer_job_request",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "job_request": {
+       "type": "object",
+       "required": [
+        "spec"
+       ],
+       "properties": {
+        "name": {
+         "type": "string"
+        },
+        "project": {
+         "type": "string"
+        },
+        "spec": {
+         "type": "object",
+         "required": [
+          "num_records",
+          "config"
+         ],
+         "properties": {
+          "num_records": {
+           "type": "number"
+          },
+          "config": {
+           "type": "object",
+           "required": [
+            "columns"
+           ],
+           "properties": {
+            "columns": {
+             "type": "array",
+             "items": {
+              "type": "object",
+              "required": [
+               "name",
+               "column_type"
+              ],
+              "properties": {
+               "name": {
+                "type": "string"
+               },
+               "column_type": {
+                "type": "string"
+               },
+               "drop": {
+                "type": "boolean"
+               },
+               "expr": {
+                "type": "string"
+               },
+               "dtype": {
+                "type": "string"
+               },
+               "sampler_type": {
+                "type": "string"
+               },
+               "params": {
+                "anyOf": [
+                 {
+                  "type": "object",
+                  "required": [
+                   "values"
+                  ],
+                  "properties": {
+                   "values": {
+                    "type": "array",
+                    "items": {
+                     "anyOf": [
+                      {
+                       "type": "string"
+                      },
+                      {
+                       "type": "number"
+                      }
+                     ]
+                    }
+                   },
+                   "weights": {
+                    "type": "array",
+                    "items": {
+                     "type": "number"
+                    }
+                   }
+                  },
+                  "additionalProperties": false
+                 },
+                 {
+                  "type": "object",
+                  "required": [
+                   "category",
+                   "values"
+                  ],
+                  "properties": {
+                   "category": {
+                    "type": "string"
+                   },
+                   "values": {
+                    "type": "object",
+                    "additionalProperties": {
+                     "type": "array",
+                     "items": {
+                      "anyOf": [
+                       {
+                        "type": "string"
+                       },
+                       {
+                        "type": "number"
+                       }
+                      ]
+                     }
+                    }
+                   }
+                  },
+                  "additionalProperties": false
+                 },
+                 {
+                  "type": "object",
+                  "required": [
+                   "low",
+                   "high"
+                  ],
+                  "properties": {
+                   "low": {
+                    "type": "number"
+                   },
+                   "high": {
+                    "type": "number"
+                   },
+                   "decimal_places": {
+                    "type": "integer"
+                   }
+                  },
+                  "additionalProperties": false
+                 },
+                 {
+                  "type": "object",
+                  "required": [
+                   "mean",
+                   "stddev"
+                  ],
+                  "properties": {
+                   "mean": {
+                    "type": "number"
+                   },
+                   "stddev": {
+                    "type": "number"
+                   },
+                   "decimal_places": {
+                    "type": "integer"
+                   }
+                  },
+                  "additionalProperties": false
+                 },
+                 {
+                  "type": "object",
+                  "required": [
+                   "mean"
+                  ],
+                  "properties": {
+                   "mean": {
+                    "type": "number"
+                   }
+                  },
+                  "additionalProperties": false
+                 },
+                 {
+                  "type": "object",
+                  "required": [
+                   "p"
+                  ],
+                  "properties": {
+                   "p": {
+                    "type": "number"
+                   }
+                  },
+                  "additionalProperties": false
+                 },
+                 {
+                  "type": "object",
+                  "required": [
+                   "n",
+                   "p"
+                  ],
+                  "properties": {
+                   "n": {
+                    "type": "integer"
+                   },
+                   "p": {
+                    "type": "number"
+                   }
+                  },
+                  "additionalProperties": false
+                 },
+                 {
+                  "type": "object",
+                  "required": [
+                   "p",
+                   "dist_name",
+                   "dist_params"
+                  ],
+                  "properties": {
+                   "p": {
+                    "type": "number"
+                   },
+                   "dist_name": {
+                    "type": "string"
+                   },
+                   "dist_params": {
+                    "type": "object",
+                    "additionalProperties": true
+                   }
+                  },
+                  "additionalProperties": false
+                 },
+                 {
+                  "type": "object",
+                  "required": [
+                   "dist_name",
+                   "dist_params"
+                  ],
+                  "properties": {
+                   "dist_name": {
+                    "type": "string"
+                   },
+                   "dist_params": {
+                    "type": "object",
+                    "additionalProperties": true
+                   },
+                   "decimal_places": {
+                    "type": "integer"
+                   }
+                  },
+                  "additionalProperties": false
+                 },
+                 {
+                  "type": "object",
+                  "required": [
+                   "dt_min",
+                   "dt_max",
+                   "reference_column_name"
+                  ],
+                  "properties": {
+                   "dt_min": {
+                    "type": "integer"
+                   },
+                   "dt_max": {
+                    "type": "integer"
+                   },
+                   "reference_column_name": {
+                    "type": "string"
+                   },
+                   "unit": {
+                    "type": "string"
+                   }
+                  },
+                  "additionalProperties": false
+                 },
+                 {
+                  "type": "object",
+                  "required": [
+                   "start",
+                   "end"
+                  ],
+                  "properties": {
+                   "start": {
+                    "type": "string"
+                   },
+                   "end": {
+                    "type": "string"
+                   },
+                   "unit": {
+                    "type": "string"
+                   }
+                  },
+                  "additionalProperties": false
+                 },
+                 {
+                  "type": "object",
+                  "properties": {
+                   "prefix": {
+                    "type": "string"
+                   },
+                   "short_form": {
+                    "type": "boolean"
+                   },
+                   "uppercase": {
+                    "type": "boolean"
+                   }
+                  },
+                  "additionalProperties": false
+                 },
+                 {
+                  "type": "object",
+                  "properties": {
+                   "locale": {
+                    "type": "string"
+                   },
+                   "sex": {
+                    "type": "string"
+                   },
+                   "age_range": {
+                    "type": "array",
+                    "items": {
+                     "type": "integer"
+                    }
+                   },
+                   "city": {
+                    "anyOf": [
+                     {
+                      "type": "string"
+                     },
+                     {
+                      "type": "array",
+                      "items": {
+                       "type": "string"
+                      }
+                     }
+                    ]
+                   },
+                   "select_field_values": {
+                    "type": "object",
+                    "additionalProperties": true
+                   },
+                   "with_synthetic_personas": {
+                    "type": "boolean"
+                   }
+                  },
+                  "additionalProperties": false
+                 }
+                ]
+               },
+               "code_lang": {
+                "type": "string"
+               },
+               "scores": {
+                "type": "array",
+                "items": {
+                 "type": "object"
+                }
+               },
+               "output_format": {
+                "type": "object",
+                "additionalProperties": true
+               },
+               "prompt": {
+                "type": "string"
+               },
+               "model_alias": {
+                "type": "string"
+               },
+               "system_prompt": {
+                "type": "string"
+               },
+               "extract_reasoning_content": {
+                "type": "boolean"
+               }
+              },
+              "additionalProperties": true
+             }
+            },
+            "model_configs": {
+             "type": "array",
+             "items": {
+              "type": "object",
+              "required": [
+               "alias",
+               "model",
+               "provider"
+              ],
+              "properties": {
+               "alias": {
+                "type": "string"
+               },
+               "skip_health_check": {
+                "type": "boolean"
+               },
+               "model": {
+                "type": "string"
+               },
+               "provider": {
+                "type": "string"
+               },
+               "inference_parameters": {
+                "type": "object",
+                "properties": {
+                 "generation_type": {
+                  "type": "string"
+                 },
+                 "max_tokens": {
+                  "type": "number"
+                 },
+                 "temperature": {
+                  "type": "number"
+                 },
+                 "top_p": {
+                  "type": "number"
+                 },
+                 "max_parallel_requests": {
+                  "type": "number"
+                 },
+                 "extra_body": {
+                  "type": "object",
+                  "additionalProperties": true
+                 }
+                }
+               }
+              },
+              "additionalProperties": true
+             }
+            },
+            "seed_config": {
+             "type": "object",
+             "properties": {
+              "source": {
+               "type": "object"
+              },
+              "sampling_strategy": {
+               "type": "string"
+              }
+             },
+             "additionalProperties": true
+            },
+            "constraints": {
+             "type": "array",
+             "items": {
+              "type": "object"
+             }
+            },
+            "processors": {
+             "type": "array",
+             "items": {
+              "type": "object"
+             }
+            }
+           },
+           "additionalProperties": false
+          }
+         },
+         "additionalProperties": false
+        }
+       },
+       "additionalProperties": false
+      }
+     },
+     "required": [
+      "job_request"
+     ]
+    }
+   }
+  }
+ ],
+ "tool_choice": "required",
+ "max_tokens": 4096
+}
