@@ -1646,23 +1646,25 @@ static void dequantize_block_mxfp4(const void * __restrict__ vx, dst_t * __restr
     }
 }
 
-// Reordered MXFP4 ([qs...][e...], see ggml_sycl_reordered::block_q_t<MXFP4>): one work-item per block.
+// Reordered MXFP4 ([qs...][e...], see ggml_sycl_reordered::block_q_t<MXFP4>)
 template <typename dst_t>
 static void dequantize_block_mxfp4_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t k,
                                            const sycl::nd_item<3> & item_ct1) {
-    const int64_t ib = (int64_t) item_ct1.get_group(2) * WARP_SIZE + item_ct1.get_local_id(2);
-    if (ib >= k / QK_MXFP4) {
-        return;
-    }
+    // one thread per qs byte, like dequantize_block<dequantize_q4_0>; the reorder layout makes the byte reads contiguous
+    // grid-stride loop because the launcher may shrink the work-group to keep the global range below INT_MAX
+    const uint8_t * e_ptr  = (const uint8_t *) vx + k/2;
+    const int64_t   stride = item_ct1.get_local_range(2) * item_ct1.get_group_range(2);
 
-    const uint8_t * qs = (const uint8_t *) vx + ib * (QK_MXFP4 / 2);
-    const float     d  = ggml_sycl_e8m0_to_fp32(((const uint8_t *) vx)[k / 2 + ib]) * 0.5f;
-    dst_t *         y  = yy + ib * QK_MXFP4;
+    for (int64_t iq = item_ct1.get_global_id(2); iq < k/2; iq += stride) {
+        const int64_t ib  = iq / (QK_MXFP4/2);
+        const int     iqs = iq % (QK_MXFP4/2);
 
-#pragma unroll
-    for (int j = 0; j < QK_MXFP4 / 2; ++j) {
-        y[j]                = d * kvalues_mxfp4[qs[j] & 0xf];
-        y[j + QK_MXFP4 / 2] = d * kvalues_mxfp4[qs[j] >> 4];
+        const float   d = ggml_sycl_e8m0_to_fp32(e_ptr[ib]) * 0.5f;
+        const uint8_t q = ((const uint8_t *) vx)[iq];
+
+        dst_t * y = yy + ib*QK_MXFP4 + iqs;
+        y[0]          = d * kvalues_mxfp4[q & 0xf];
+        y[QK_MXFP4/2] = d * kvalues_mxfp4[q >> 4];
     }
 }
 

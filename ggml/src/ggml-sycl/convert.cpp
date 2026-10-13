@@ -540,11 +540,13 @@ static void dequantize_row_mxfp4_sycl(const void * vx, dst_t * y, const int64_t 
 template <typename dst_t>
 static void dequantize_row_mxfp4_sycl_reorder(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
     GGML_ASSERT(k % QK_MXFP4 == 0);
-    const int n_warp = (k / QK_MXFP4 + WARP_SIZE - 1) / WARP_SIZE;
+    const int64_t n_groups = ceil_div(k / 2, SYCL_DEQUANTIZE_BLOCK_SIZE);
+    // decrease global range when it exceeds the max int; the kernel loops to cover the rest
+    const int64_t wg_size  = downsample_sycl_global_range(n_groups, SYCL_DEQUANTIZE_BLOCK_SIZE);
     stream->parallel_for(
-        sycl::nd_range<3>(sycl::range<3>(1, 1, n_warp) * sycl::range<3>(1, 1, WARP_SIZE),
-                          sycl::range<3>(1, 1, WARP_SIZE)),
-        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+        sycl::nd_range<3>(sycl::range<3>(1, 1, n_groups) * sycl::range<3>(1, 1, wg_size),
+                          sycl::range<3>(1, 1, wg_size)),
+        [=](sycl::nd_item<3> item_ct1) {
             dequantize_block_mxfp4_reorder(vx, y, k, item_ct1);
         });
 }
