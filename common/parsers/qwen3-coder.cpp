@@ -56,7 +56,7 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
             data.generation_prompt += msg.render_content();
         }
 
-        data.prompt += data.generation_prompt;
+        data.prompt.append(data.generation_prompt);
     }
 
     std::vector<std::string> tool_call_starts = { "<tool_call>" };
@@ -71,7 +71,7 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
         });
     }
 
-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+    data.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto generation_prompt = p.literal(GEN_PREFIX);
 
         auto reasoning = p.eps();
@@ -109,7 +109,8 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
 
                     auto arg_value = p.eps();
                     if (!types.has(common_chat_schema::TYPE_STRING)) {
-                        arg_value = p.tool_arg_json_value(p.schema(p.json(), rule_name + "-schema", doc, *param.schema)) + arg_close;
+                        // Accept object keys in any order, as Qwen does not always adhere to the order provided.
+                        arg_value = p.tool_arg_json_value(p.unordered_schema(p.schema(p.json(), rule_name + "-schema", doc, *param.schema))) + arg_close;
                     } else if (types.is_only(common_chat_schema::TYPE_STRING)) {
                         arg_value = arg_string;
                     } else {
@@ -174,13 +175,11 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
         return generation_prompt + (reasoning << p.content(p.rest()));
     });
 
-    data.parser = parser.save();
-
     if (include_grammar) {
         data.grammar_lazy = has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
 
         data.grammar = build_grammar([&](const common_grammar_builder & builder) {
-            parser.build_grammar(builder, data.grammar_lazy);
+            data.parser.build_grammar(builder, data.grammar_lazy);
         });
 
         if (data.grammar_lazy) {
