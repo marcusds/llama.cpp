@@ -7,6 +7,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdint>
+#include <iterator>
 #include <set>
 #include <stdexcept>
 
@@ -1340,15 +1341,25 @@ struct llama_grammar * llama_grammar_clone_impl(const struct llama_grammar & gra
         grammar.trigger_patterns,
     };
 
-    // redirect elements in stacks to point to new rules
-    for (size_t is = 0; is < result->stacks.size(); is++) {
-        for (size_t ie = 0; ie < result->stacks[is].size(); ie++) {
-            for (size_t ir0 = 0; ir0 < grammar.rules.size(); ir0++) {
-                for (size_t ir1 = 0; ir1 < grammar.rules[ir0].size(); ir1++) {
-                    if (grammar.stacks[is][ie] == &grammar.rules[ir0][ir1]) {
-                        result->stacks[is][ie] =  &result->rules[ir0][ir1];
-                    }
-                }
+    // redirect elements in stacks to point to new rules: find the rule by its start address, keep the offset
+    std::vector<std::pair<uintptr_t, size_t>> rule_starts;
+    rule_starts.reserve(grammar.rules.size());
+    for (size_t ir = 0; ir < grammar.rules.size(); ir++) {
+        rule_starts.emplace_back(reinterpret_cast<uintptr_t>(grammar.rules[ir].data()), ir);
+    }
+    std::sort(rule_starts.begin(), rule_starts.end());
+
+    for (auto & stack : result->stacks) {
+        for (auto & elem : stack) {
+            const uintptr_t addr = reinterpret_cast<uintptr_t>(elem);
+            auto it = std::upper_bound(rule_starts.begin(), rule_starts.end(), std::make_pair(addr, SIZE_MAX));
+            if (it == rule_starts.begin()) {
+                continue;
+            }
+            const size_t ir  = std::prev(it)->second;
+            const size_t off = (addr - std::prev(it)->first) / sizeof(llama_grammar_element);
+            if (off < grammar.rules[ir].size()) {
+                elem = &result->rules[ir][off];
             }
         }
     }

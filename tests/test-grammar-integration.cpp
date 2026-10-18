@@ -11,6 +11,7 @@
 
 #include <cassert>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using json = common_json;
@@ -1478,6 +1479,39 @@ static void test_json_schema() {
     );
 }
 
+static void test_clone_mid_parse() {
+    const std::string grammar_str = R"""(
+        root  ::= "{" item ("," item)* "}"
+        item  ::= key ":" value
+        key   ::= "a" | "bb" | "ccc"
+        value ::= [0-9]+ | "[" value "]"
+    )""";
+    const std::vector<std::tuple<std::string, std::string, bool>> cases = {
+        {"{a:1,bb:[", "2]}",   true},
+        {"{ccc:[[3",  "]]}",   true},
+        {"{a",        ":12}",  true},
+        {"{a:1,bb:[", "2}",    false},
+        {"{ccc:[[3",  "],a}",  false},
+    };
+    for (const auto & [prefix, rest, expected] : cases) {
+        fprintf(stderr, "⚫ Testing clone after \"%s\", then \"%s\"\n", prefix.c_str(), rest.c_str());
+        auto * grammar = build_grammar(grammar_str);
+        for (const auto & in : parse_tokens(prefix)) {
+            llama_grammar_accept_token(*grammar, in.token, in.piece);
+        }
+        auto * clone = llama_grammar_clone_impl(*grammar);
+        llama_grammar_free_impl(grammar);
+        bool matched = match_string(rest, clone);
+        llama_grammar_free_impl(clone);
+        if (matched != expected) {
+            fprintf(stderr, "  ❌ expected %s\n", expected ? "match" : "no match");
+        } else {
+            fprintf(stdout, "  ✅︎\n");
+        }
+        assert(matched == expected);
+    }
+}
+
 int main() {
     fprintf(stdout, "Running grammar integration tests...\n");
     test_simple_grammar();
@@ -1490,6 +1524,7 @@ int main() {
     test_failure_missing_root_symbol();
     test_custom_root_symbol_check();
     test_json_schema();
+    test_clone_mid_parse();
     fprintf(stdout, "All tests passed.\n");
     return 0;
 }
