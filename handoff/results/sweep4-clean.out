@@ -1,0 +1,196 @@
+waiting for other GPU jobs to finish (08:10:03)
+idle again, continuing (09:07:56)
+none load=109s vram=201115 MiB free_ram=3G/avail 356G mlocked_kB=0
+none-cold short-gen#0: prompt=37 ttft=0.39s prefill~94 tok/s | gen=131 tok decode=8.9 tok/s
+none-cold short-gen#1: prompt=37 ttft=0.33s prefill~113 tok/s | gen=131 tok decode=9.0 tok/s
+none-cold short-gen#2: prompt=37 ttft=0.50s prefill~74 tok/s | gen=131 tok decode=9.1 tok/s
+none-cold long-prefill: prompt=3743 ttft=410.24s prefill~9 tok/s | gen=32 tok decode=9.1 tok/s
+none-cold 4-concurrent: 484 tok in 59.6s = 8.1 tok/s aggregate
+none-cold SUMMARY single-stream decode median=9.0 tok/s
+none-warm short-gen#0: prompt=37 ttft=0.35s prefill~106 tok/s | gen=119 tok decode=8.8 tok/s
+none-warm short-gen#1: prompt=37 ttft=0.45s prefill~83 tok/s | gen=119 tok decode=9.0 tok/s
+none-warm short-gen#2: prompt=37 ttft=0.45s prefill~82 tok/s | gen=119 tok decode=9.1 tok/s
+none-warm long-prefill: prompt=3743 ttft=0.49s prefill~7606 tok/s | gen=32 tok decode=9.2 tok/s
+none-warm 4-concurrent: 473 tok in 55.8s = 8.5 tok/s aggregate
+none-warm SUMMARY single-stream decode median=9.0 tok/s
+none top_cpu:  516 llama-server; 200 ps; 182 python3; 118 vllm;
+none vram_after=201263 MiB swap_so=0 CONTAMINATED=0
+mmap-base FAILED to start: 6.22.906.610 I srv    operator(): operator(): cleaning up before exit...
+6.22.922.284 E srv  server_run_i: exiting due to model loading error
+mmap-ub1024 load=173s vram=201489 MiB free_ram=263G/avail 464G mlocked_kB=0
+mmap-ub1024-cold short-gen#0: prompt=37 ttft=0.43s prefill~86 tok/s | gen=131 tok decode=2.0 tok/s
+mmap-ub1024-cold short-gen#1: prompt=37 ttft=0.46s prefill~80 tok/s | gen=131 tok decode=9.1 tok/s
+mmap-ub1024-cold short-gen#2: prompt=37 ttft=0.47s prefill~79 tok/s | gen=131 tok decode=8.9 tok/s
+mmap-ub1024-cold long-prefill: prompt=3743 ttft=256.95s prefill~15 tok/s | gen=32 tok decode=6.5 tok/s
+mmap-ub1024-cold 4-concurrent: 486 tok in 60.9s = 8.0 tok/s aggregate
+mmap-ub1024-cold SUMMARY single-stream decode median=8.9 tok/s
+mmap-ub1024-warm short-gen#0: prompt=37 ttft=0.49s prefill~76 tok/s | gen=119 tok decode=7.9 tok/s
+mmap-ub1024-warm short-gen#1: prompt=37 ttft=0.50s prefill~75 tok/s | gen=119 tok decode=9.0 tok/s
+mmap-ub1024-warm short-gen#2: prompt=37 ttft=0.52s prefill~71 tok/s | gen=119 tok decode=9.0 tok/s
+mmap-ub1024-warm long-prefill: prompt=3743 ttft=0.49s prefill~7656 tok/s | gen=32 tok decode=9.0 tok/s
+mmap-ub1024-warm 4-concurrent: 512 tok in 57.3s = 8.9 tok/s aggregate
+mmap-ub1024-warm SUMMARY single-stream decode median=9.0 tok/s
+mmap-ub1024 top_cpu: 1571 llama-server; 300 ps; 167 vllm; 100 tr;
+mmap-ub1024 vram_after=201669 MiB swap_so=0 CONTAMINATED=0
+mmap-ub2048 load=132s vram=202239 MiB free_ram=173G/avail 463G mlocked_kB=0
+mmap-ub2048-cold short-gen#0: prompt=37 ttft=0.50s prefill~74 tok/s | gen=131 tok decode=8.5 tok/s
+mmap-ub2048-cold short-gen#1: prompt=37 ttft=0.46s prefill~80 tok/s | gen=131 tok decode=9.3 tok/s
+mmap-ub2048-cold short-gen#2: prompt=37 ttft=0.50s prefill~75 tok/s | gen=131 tok decode=8.7 tok/s
+mmap-ub2048-cold long-prefill: prompt=3743 ttft=262.10s prefill~14 tok/s | gen=32 tok decode=8.1 tok/s
+mmap-ub2048-cold 4-concurrent: 512 tok in 47.9s = 10.7 tok/s aggregate
+mmap-ub2048-cold SUMMARY single-stream decode median=8.7 tok/s
+mmap-ub2048-warm short-gen#0: prompt=37 ttft=0.54s prefill~68 tok/s | gen=103 tok decode=8.9 tok/s
+mmap-ub2048-warm short-gen#1: prompt=37 ttft=0.43s prefill~86 tok/s | gen=103 tok decode=9.3 tok/s
+mmap-ub2048-warm short-gen#2: prompt=37 ttft=0.49s prefill~75 tok/s | gen=103 tok decode=9.1 tok/s
+mmap-ub2048-warm long-prefill: prompt=3743 ttft=0.50s prefill~7486 tok/s | gen=32 tok decode=9.1 tok/s
+mmap-ub2048-warm 4-concurrent: 511 tok in 57.2s = 8.9 tok/s aggregate
+mmap-ub2048-warm SUMMARY single-stream decode median=9.1 tok/s
+mmap-ub2048 top_cpu:  983 llama-server; 274 python3; 200 nvidia-smi; 166 ps;
+mmap-ub2048 vram_after=202483 MiB swap_so=0 CONTAMINATED=0
+mmap-ub4096 load=138s vram=203749 MiB free_ram=173G/avail 464G mlocked_kB=0
+mmap-ub4096-cold short-gen#0: prompt=37 ttft=0.52s prefill~72 tok/s | gen=131 tok decode=8.6 tok/s
+mmap-ub4096-cold short-gen#1: prompt=37 ttft=0.48s prefill~78 tok/s | gen=131 tok decode=9.2 tok/s
+mmap-ub4096-cold short-gen#2: prompt=37 ttft=0.52s prefill~71 tok/s | gen=131 tok decode=9.3 tok/s
+mmap-ub4096-cold long-prefill: prompt=3743 ttft=251.80s prefill~15 tok/s | gen=32 tok decode=8.3 tok/s
+mmap-ub4096-cold 4-concurrent: 484 tok in 61.3s = 7.9 tok/s aggregate
+mmap-ub4096-cold SUMMARY single-stream decode median=9.2 tok/s
+mmap-ub4096-warm short-gen#0: prompt=37 ttft=0.43s prefill~86 tok/s | gen=119 tok decode=9.1 tok/s
+mmap-ub4096-warm short-gen#1: prompt=37 ttft=0.50s prefill~74 tok/s | gen=119 tok decode=9.0 tok/s
+mmap-ub4096-warm short-gen#2: prompt=37 ttft=0.45s prefill~82 tok/s | gen=119 tok decode=9.1 tok/s
+mmap-ub4096-warm long-prefill: prompt=3743 ttft=0.44s prefill~8490 tok/s | gen=32 tok decode=9.8 tok/s
+mmap-ub4096-warm 4-concurrent: 473 tok in 55.4s = 8.5 tok/s aggregate
+mmap-ub4096-warm SUMMARY single-stream decode median=9.1 tok/s
+mmap-ub4096 top_cpu: 1058 llama-server; 291 vllm; 200 ps; 100 tr;
+mmap-ub4096 vram_after=204099 MiB swap_so=0 CONTAMINATED=0
+none-ub2048 load=74s vram=202239 MiB free_ram=55G/avail 356G mlocked_kB=0
+none-ub2048-cold short-gen#0: prompt=37 ttft=0.50s prefill~74 tok/s | gen=131 tok decode=8.9 tok/s
+none-ub2048-cold short-gen#1: prompt=37 ttft=0.47s prefill~78 tok/s | gen=131 tok decode=9.1 tok/s
+none-ub2048-cold short-gen#2: prompt=37 ttft=0.55s prefill~67 tok/s | gen=131 tok decode=9.1 tok/s
+none-ub2048-cold long-prefill: prompt=3743 ttft=4.09s prefill~915 tok/s | gen=32 tok decode=9.2 tok/s
+none-ub2048-cold 4-concurrent: 499 tok in 57.4s = 8.7 tok/s aggregate
+none-ub2048-cold SUMMARY single-stream decode median=9.1 tok/s
+none-ub2048-warm short-gen#0: prompt=37 ttft=0.52s prefill~71 tok/s | gen=119 tok decode=9.0 tok/s
+none-ub2048-warm short-gen#1: prompt=37 ttft=0.44s prefill~85 tok/s | gen=119 tok decode=9.1 tok/s
+none-ub2048-warm short-gen#2: prompt=37 ttft=0.50s prefill~74 tok/s | gen=119 tok decode=9.0 tok/s
+none-ub2048-warm long-prefill: prompt=3743 ttft=0.46s prefill~8162 tok/s | gen=32 tok decode=9.4 tok/s
+none-ub2048-warm 4-concurrent: 484 tok in 58.7s = 8.2 tok/s aggregate
+none-ub2048-warm SUMMARY single-stream decode median=9.0 tok/s
+none-ub2048 top_cpu: 2167 llama-server; 181 VLLM::EngineCor;90.8 vllm;32.1 k3s;
+none-ub2048 vram_after=203165 MiB swap_so=0 CONTAMINATED=1
+waiting for other GPU jobs to finish (10:18:21)
+idle again, continuing (10:19:21)
+mmap+mlock load=325s vram=252341 MiB free_ram=19G/avail 45G mlocked_kB=0
+mmap+mlock-cold short-gen#0: prompt=37 ttft=0.47s prefill~79 tok/s | gen=131 tok decode=2.0 tok/s
+mmap+mlock-cold short-gen#1: prompt=37 ttft=0.49s prefill~76 tok/s | gen=131 tok decode=9.0 tok/s
+mmap+mlock-cold short-gen#2: prompt=37 ttft=0.47s prefill~79 tok/s | gen=131 tok decode=9.4 tok/s
+mmap+mlock-cold long-prefill: prompt=3743 ttft=272.07s prefill~14 tok/s | gen=32 tok decode=7.4 tok/s
+mmap+mlock-cold 4-concurrent: 512 tok in 48.1s = 10.7 tok/s aggregate
+mmap+mlock-cold SUMMARY single-stream decode median=9.0 tok/s
+mmap+mlock-warm short-gen#0: prompt=37 ttft=0.48s prefill~78 tok/s | gen=103 tok decode=7.1 tok/s
+mmap+mlock-warm short-gen#1: prompt=37 ttft=0.48s prefill~77 tok/s | gen=103 tok decode=9.1 tok/s
+mmap+mlock-warm short-gen#2: prompt=37 ttft=0.45s prefill~82 tok/s | gen=103 tok decode=9.2 tok/s
+mmap+mlock-warm long-prefill: prompt=3743 ttft=0.46s prefill~8077 tok/s | gen=32 tok decode=8.2 tok/s
+mmap+mlock-warm 4-concurrent: 511 tok in 59.9s = 8.5 tok/s aggregate
+mmap+mlock-warm SUMMARY single-stream decode median=9.1 tok/s
+mmap+mlock top_cpu: 1268 llama-server; 200 ps; 194 python3; 122 vllm;
+mmap+mlock vram_after=201265 MiB swap_so=0 CONTAMINATED=0
+mlock load=130s vram=220217 MiB free_ram=14G/avail 54G mlocked_kB=113267336
+mlock-cold short-gen#0: prompt=37 ttft=0.49s prefill~75 tok/s | gen=131 tok decode=5.9 tok/s
+mlock-cold short-gen#1: prompt=37 ttft=0.61s prefill~61 tok/s | gen=131 tok decode=4.9 tok/s
+mlock-cold short-gen#2: prompt=37 ttft=0.59s prefill~63 tok/s | gen=131 tok decode=5.0 tok/s
+mlock-cold long-prefill: prompt=3743 ttft=7.66s prefill~489 tok/s | gen=32 tok decode=5.1 tok/s
+mlock-cold 4-concurrent: 188 tok in 934.1s = 0.2 tok/s aggregate
+mlock-cold SUMMARY single-stream decode median=5.0 tok/s
+Traceback (most recent call last):
+  File "/usr/lib/python3.14/urllib/request.py", line 1321, in do_open
+    h.request(req.get_method(), req.selector, req.data, headers,
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+              encode_chunked=req.has_header('Transfer-encoding'))
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/http/client.py", line 1367, in request
+    self._send_request(method, url, body, headers, encode_chunked)
+    ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/http/client.py", line 1413, in _send_request
+    self.endheaders(body, encode_chunked=encode_chunked)
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/http/client.py", line 1362, in endheaders
+    self._send_output(message_body, encode_chunked=encode_chunked)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/http/client.py", line 1122, in _send_output
+    self.send(msg)
+    ~~~~~~~~~^^^^^
+  File "/usr/lib/python3.14/http/client.py", line 1066, in send
+    self.connect()
+    ~~~~~~~~~~~~^^
+  File "/usr/lib/python3.14/http/client.py", line 1032, in connect
+    self.sock = self._create_connection(
+                ~~~~~~~~~~~~~~~~~~~~~~~^
+        (self.host,self.port), self.timeout, self.source_address)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/socket.py", line 870, in create_connection
+    raise exceptions[0]
+  File "/usr/lib/python3.14/socket.py", line 855, in create_connection
+    sock.connect(sa)
+    ~~~~~~~~~~~~^^^^
+ConnectionRefusedError: [Errno 111] Connection refused
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/tmp/claude-2583/-opt-llm/6208515b-34fc-4614-9a6c-09726d5719d6/scratchpad/bench.py", line 41, in <module>
+    run(short, 16)  # warmup
+    ~~~^^^^^^^^^^^
+  File "/tmp/claude-2583/-opt-llm/6208515b-34fc-4614-9a6c-09726d5719d6/scratchpad/bench.py", line 13, in run
+    with urllib.request.urlopen(req, timeout=900) as r:
+         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/urllib/request.py", line 187, in urlopen
+    return opener.open(url, data, timeout)
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/urllib/request.py", line 487, in open
+    response = self._open(req, data)
+  File "/usr/lib/python3.14/urllib/request.py", line 504, in _open
+    result = self._call_chain(self.handle_open, protocol, protocol +
+                              '_open', req)
+  File "/usr/lib/python3.14/urllib/request.py", line 464, in _call_chain
+    result = func(*args)
+  File "/usr/lib/python3.14/urllib/request.py", line 1350, in http_open
+    return self.do_open(http.client.HTTPConnection, req)
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/urllib/request.py", line 1324, in do_open
+    raise URLError(err)
+urllib.error.URLError: <urlopen error [Errno 111] Connection refused>
+mlock top_cpu:  525 ps; 422 llama-server; 300 gcr-ssh-agent; 187 VLLM::EngineCor;
+mlock vram_after=220290 MiB swap_so=3828 CONTAMINATED=1
+waiting for other GPU jobs to finish (10:54:22)
+idle again, continuing (10:54:53)
+mmap-t36 load=112s vram=201116 MiB free_ram=262G/avail 463G mlocked_kB=0
+mmap-t36-cold short-gen#0: prompt=37 ttft=0.37s prefill~101 tok/s | gen=131 tok decode=2.6 tok/s
+mmap-t36-cold short-gen#1: prompt=37 ttft=0.44s prefill~84 tok/s | gen=131 tok decode=5.1 tok/s
+mmap-t36-cold short-gen#2: prompt=37 ttft=0.31s prefill~118 tok/s | gen=131 tok decode=4.7 tok/s
+mmap-t36-cold long-prefill: prompt=3743 ttft=269.68s prefill~14 tok/s | gen=32 tok decode=4.6 tok/s
+mmap-t36-cold 4-concurrent: 499 tok in 38.5s = 13.0 tok/s aggregate
+mmap-t36-cold SUMMARY single-stream decode median=4.7 tok/s
+mmap-t36-warm short-gen#0: prompt=37 ttft=0.26s prefill~143 tok/s | gen=119 tok decode=4.6 tok/s
+mmap-t36-warm short-gen#1: prompt=37 ttft=0.13s prefill~289 tok/s | gen=119 tok decode=5.0 tok/s
+mmap-t36-warm short-gen#2: prompt=37 ttft=0.44s prefill~84 tok/s | gen=119 tok decode=4.4 tok/s
+mmap-t36-warm long-prefill: prompt=3743 ttft=0.17s prefill~22256 tok/s | gen=32 tok decode=4.5 tok/s
+mmap-t36-warm 4-concurrent: 472 tok in 39.5s = 11.9 tok/s aggregate
+mmap-t36-warm SUMMARY single-stream decode median=4.6 tok/s
+mmap-t36 top_cpu:  862 llama-server; 780 python3; 772 python3; 189 VLLM::EngineCor;
+mmap-t36 vram_after=201264 MiB swap_so=0 CONTAMINATED=0
+mmap-t48 load=141s vram=215023 MiB free_ram=3G/avail 285G mlocked_kB=0
+mmap-t48-cold short-gen#0: prompt=37 ttft=0.54s prefill~68 tok/s | gen=131 tok decode=1.6 tok/s
+mmap-t48-cold short-gen#1: prompt=37 ttft=2.09s prefill~18 tok/s | gen=131 tok decode=3.4 tok/s
+mmap-t48-cold short-gen#2: prompt=37 ttft=0.49s prefill~75 tok/s | gen=131 tok decode=1.6 tok/s
+mmap-t48-cold long-prefill: prompt=3743 ttft=604.36s prefill~6 tok/s | gen=32 tok decode=5.2 tok/s
+mmap-t48-cold 4-concurrent: 499 tok in 174.6s = 2.9 tok/s aggregate
+mmap-t48-cold SUMMARY single-stream decode median=1.6 tok/s
+mmap-t48-warm short-gen#0: prompt=37 ttft=0.36s prefill~102 tok/s | gen=119 tok decode=7.5 tok/s
+mmap-t48-warm short-gen#1: prompt=37 ttft=0.38s prefill~98 tok/s | gen=119 tok decode=9.4 tok/s
+mmap-t48-warm short-gen#2: prompt=37 ttft=0.49s prefill~75 tok/s | gen=119 tok decode=7.9 tok/s
+mmap-t48-warm long-prefill: prompt=3743 ttft=0.36s prefill~10357 tok/s | gen=32 tok decode=7.3 tok/s
+mmap-t48-warm 4-concurrent: 484 tok in 59.7s = 8.1 tok/s aggregate
+mmap-t48-warm SUMMARY single-stream decode median=7.9 tok/s
+mmap-t48 top_cpu:  859 llama-server; 300 ps;83.3 k3s;46.8 vllm;
+mmap-t48 vram_after=201265 MiB swap_so=0 CONTAMINATED=0
+DONE

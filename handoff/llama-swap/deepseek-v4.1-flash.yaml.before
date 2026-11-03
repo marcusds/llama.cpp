@@ -1,0 +1,27 @@
+# DeepSeek-V4.1-Flash-1017 (552B MoE) -- served by the vLLM container dsv41-vllm-a on
+# THIS host (127.0.0.1:30006), started and stopped out-of-band by
+# /opt/llm/vllm-a/serve-dsv41-uva.sh (vLLM UVA + DSpark, ctx 131072). This fragment only
+# registers a llama-swap PROXY entry so clients on :9292 can select the model; llama-swap
+# does not own the container. This llama-swap build (v241) rejects an empty cmd for a
+# proxy model, so cmd is a no-op keepalive that holds no memory itself.
+#
+# The container holds ~239 GiB HBM and ~440 GiB pinned host RAM while up. llama-swap
+# cannot see that, so loading another HBM-heavy or host-RAM-heavy model alongside it
+# drives a global OOM. It is the resident model here: see the residency policy in
+# ../llama-swap.yaml. Delete this file to un-expose.
+models:
+  "deepseek-v4.1-flash":
+    name: "DeepSeek-V4.1-Flash-1017 (vLLM UVA, local container)"
+    description: "Proxy to 127.0.0.1:30006 (dsv41-vllm-a). DeepSeek-V4.1-Flash-1017 552B MoE, 128K ctx; thinking/reasoning model, tools."
+    concurrencyLimit: 8      # engine runs --max-num-seqs 8
+    cmd: |
+      sleep infinity
+    proxy: "http://127.0.0.1:30006"
+    checkEndpoint: /health
+    ttl: 600                 # drop the no-op keepalive after 10 min idle
+    useModelName: "deepseek-v4.1-flash"
+    capabilities:
+      in: [text]
+      out: [text]
+      tools: true
+      context: 131072

@@ -1,0 +1,33 @@
+ncmoe15 load=132s vram=206114 MiB free_ram=98G/avail 463G
+ncmoe15 short-gen#0: prompt=37 ttft=0.47s prefill~78 tok/s | gen=131 tok decode=11.9 tok/s
+ncmoe15 short-gen#1: prompt=37 ttft=0.41s prefill~91 tok/s | gen=131 tok decode=13.3 tok/s
+ncmoe15 short-gen#2: prompt=37 ttft=0.43s prefill~87 tok/s | gen=131 tok decode=13.0 tok/s
+ncmoe15 long-prefill: prompt=3743 ttft=292.75s prefill~13 tok/s | gen=32 tok decode=12.6 tok/s
+ncmoe15 4-concurrent: 512 tok in 42.5s = 12.0 tok/s aggregate
+ncmoe15 SUMMARY single-stream decode median=13.0 tok/s
+ncmoe15 vram_after=206250 MiB swap_so=0
+ncmoe11 load=530s vram=230279 MiB free_ram=95G/avail 463G
+ncmoe11 short-gen#0: prompt=37 ttft=0.34s prefill~107 tok/s | gen=126 tok decode=11.2 tok/s
+ncmoe11 short-gen#1: prompt=37 ttft=0.32s prefill~117 tok/s | gen=126 tok decode=14.2 tok/s
+ncmoe11 short-gen#2: prompt=37 ttft=0.31s prefill~121 tok/s | gen=126 tok decode=13.6 tok/s
+ncmoe11 long-prefill: prompt=3743 ttft=195.78s prefill~19 tok/s | gen=32 tok decode=14.4 tok/s
+ncmoe11 4-concurrent: 490 tok in 44.4s = 11.0 tok/s aggregate
+ncmoe11 SUMMARY single-stream decode median=13.6 tok/s
+ncmoe11 vram_after=230413 MiB swap_so=0
+ncmoe20 load=133s vram=164669 MiB free_ram=95G/avail 465G
+ncmoe20 short-gen#0: prompt=37 ttft=0.61s prefill~61 tok/s | gen=138 tok decode=11.1 tok/s
+ncmoe20 short-gen#1: prompt=37 ttft=0.55s prefill~68 tok/s | gen=138 tok decode=13.7 tok/s
+ncmoe20 short-gen#2: prompt=37 ttft=0.52s prefill~71 tok/s | gen=138 tok decode=13.5 tok/s
+ncmoe20 long-prefill: prompt=3743 ttft=284.77s prefill~13 tok/s | gen=32 tok decode=12.2 tok/s
+ncmoe20 4-concurrent: 500 tok in 70.4s = 7.1 tok/s aggregate
+ncmoe20 SUMMARY single-stream decode median=13.5 tok/s
+ncmoe20 vram_after=164803 MiB swap_so=0
+ncmoe15-lmnone load=78s vram=201117 MiB free_ram=8G/avail 352G
+ncmoe15-lmnone short-gen#0: prompt=37 ttft=0.53s prefill~70 tok/s | gen=131 tok decode=4.7 tok/s
+ncmoe15-lmnone short-gen#1: prompt=37 ttft=0.50s prefill~74 tok/s | gen=131 tok decode=6.6 tok/s
+ncmoe15-lmnone short-gen#2: prompt=37 ttft=0.56s prefill~66 tok/s | gen=131 tok decode=4.8 tok/s
+ncmoe15-lmnone long-prefill: prompt=3743 ttft=7.17s prefill~522 tok/s | gen=32 tok decode=7.2 tok/s
+ncmoe15-lmnone 4-concurrent: 499 tok in 53.7s = 9.3 tok/s aggregate
+ncmoe15-lmnone SUMMARY single-stream decode median=4.8 tok/s
+ncmoe15-lmnone vram_after=201253 MiB swap_so=0
+DONE

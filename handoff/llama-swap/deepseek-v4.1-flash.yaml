@@ -1,0 +1,30 @@
+# DeepSeek-V4.1-Flash-1017 (552B MoE) -- served by the vLLM container dsv41-vllm-a on
+# THIS host (127.0.0.1:30006), created and started/stopped out-of-band by
+# /opt/llm/vllm-a/serve-dsv41-uva.sh (vLLM UVA + DSpark, ctx 131072) plus docker's
+# --restart unless-stopped. This fragment only registers a llama-swap PROXY entry so clients
+# on :9292 can select the model. llama-swap rejects an empty cmd for a proxy model ("unable to
+# get sanitized command: empty command"), so cmd is a no-op keepalive that holds no memory.
+# Deliberately NOT vllm-a/llama-swap-dsv41.sh + cmdStop: llama-swap runs cmdStop on
+# every config reload and service restart, which would `docker stop` a model with a 25 min
+# cold start.
+#
+# The container holds ~239 GiB HBM and ~440 GiB pinned host RAM while up. llama-swap
+# cannot see that, so loading another HBM-heavy or host-RAM-heavy model alongside it
+# drives a global OOM. It is the resident model here: see the residency policy in
+# ../llama-swap.yaml. Delete this file to un-expose.
+models:
+  "deepseek-v4.1-flash":
+    name: "DeepSeek-V4.1-Flash-1017 (vLLM UVA, local container)"
+    description: "Container dsv41-vllm-a on 127.0.0.1:30006. DeepSeek-V4.1-Flash-1017 552B MoE, 128K ctx; thinking/reasoning model, tools."
+    concurrencyLimit: 8      # engine runs --max-num-seqs 8
+    cmd: |
+      sleep infinity
+    proxy: "http://127.0.0.1:30006"
+    checkEndpoint: /health
+    ttl: 0                   # never idle-unload: cold start is minutes and it is the resident model
+    useModelName: "deepseek-v4.1-flash"
+    capabilities:
+      in: [text]
+      out: [text]
+      tools: true
+      context: 131072
