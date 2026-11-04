@@ -110,3 +110,24 @@ Memory: page cache holds most of the GGUF (up to ~386 GB); host weights resident
 ## 8. Upstream contribution rules (`src/llama.cpp-upstream/AGENTS.md`)
 
 For ggml-org/llama.cpp: the contributor writes the PR description and any reviewer replies; an AI must not run `gh pr create`; commit messages are better written by the contributor (you OK'd drafts here); the contributor must understand and be able to defend every line; discuss feature work in an issue first; disclose meaningful AI help per the PR template (this conflicts with the global no-attribution preference: decide before opening). Code comments: short, ASCII only. No existing upstream PR for DeepSeek-V4.1 NVFP4 conversion was found (searched 2026-11-03); the architecture landed in #31086. Rebase `dsv41-nvfp4-convert` onto current master first (master moves daily).
+
+## 9. Machines and copies (added 2026-11-04)
+
+| Host | RAM | GPU | Disk free | Role |
+|---|---|---|---|---|
+| this station (`/opt/llm`, GB300) | 482 GiB (~494 GB) | GB300, 256,703 MiB (~251 GiB) | `/data` 6.6 TB | where everything was built and benchmarked; the GGUF was made here |
+| `h-station` (`4u2g-0415`) | 251 GiB | RTX A6000 | 1.7 TB on `/` | has copies only; the GPU is far too small to run this model |
+| `m-station-1` (`pmgb300ws-0160`, GB300) | 482 GiB | GB300, 256,703 MiB | 3.2 TB on `/` | has copies; same hardware as this station |
+
+Copies on both `h-station` and `m-station-1`:
+- `/data/llm/models/DeepSeek-V4.1-Flash-1017-NVFP4.gguf`, 427,057,133,344 bytes, verified with a SHA-256 per 16 chunks against the original, GGUF header present.
+- `/opt/llm/HANDOFF.md`: an earlier version of this doc (before this section). Use the git branch for the current one.
+
+How it was copied: one `rsync` stream got only ~25 MB/s on `h-station` (per-connection limit); 16 parallel `dd | ssh dd` streams got ~400 MB/s there and ~1.5 GB/s to `m-station-1`. `handoff/scripts/ptransfer2.sh <host>` does the chunked copy with retries and per-chunk hash verification, and renames `.part` to the final name only if every chunk matches. Notes: the destination sshd drops simultaneous logins (stagger them, the script retries); a killed rsync leaves its partial data under the FINAL filename (delete it); never `pkill -f` a pattern that appears in your own command line.
+
+`m-station-1` setup state:
+- `/data/llm/models` and `/opt/llm` were created by hand (sudo, owned by `local-mschwab`, mode 2775; there is no `llm` group there). Nothing else from `/opt/llm` exists there: no binaries, no source checkouts, no llama-swap.
+- Its NVIDIA driver (595.99.02, open) did not respond until the machine was rebooted. After the reboot `nvidia-smi` shows the GB300 with 255 GB free. The kernel log still has a boot-time `RmInitAdapter failed` / "GPU memory zone movable auto onlining failed" at ~52 s that recovered, and the box reports 8 NUMA nodes (0,2-8) where the original station reports 9. Run a real CUDA test before relying on it for this model.
+- To use the GGUF there: clone `dsv41-nvfp4-handoff` (or `station-20261103`), build llama.cpp for CUDA arch 103 (flags in section 7 of the build memory: Release, shared libs, `-DCMAKE_CUDA_ARCHITECTURES=103`), then follow section 5 for serve flags. The source checkpoint (`hf download nvidia/DeepSeek-V4.1-Flash-1017-NVFP4`, 400 GB) is only needed to re-convert.
+
+Correction to earlier chat statements: GPU memory on the GB300 is 256,703 MiB (~251 GiB), not 288 GB.
