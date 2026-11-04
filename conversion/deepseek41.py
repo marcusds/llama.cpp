@@ -12,7 +12,7 @@ import torch
 if TYPE_CHECKING:
     from torch import Tensor
 
-from .base import LazyTorchTensor, ModelBase, TextModel, gguf
+from .base import LazyTorchTensor, ModelBase, TextModel, gguf, logger
 from .deepseek import DeepseekV4FlashVisionModel, DeepseekV4Model
 
 
@@ -85,6 +85,9 @@ def engram_compressed_token_map(tokenizer_dir: Path) -> tuple[list[int], int]:
             key = normalized if normalized else text
         lookup[token_id] = key_to_new.setdefault(key, len(key_to_new))
     return lookup, len(key_to_new)
+
+
+_FP4_E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0])
 
 
 class _StreamedBytes:
@@ -225,35 +228,97 @@ class DeepseekV41Model(DeepseekV4Model):
         parts, dim = [], None
         for bid in layer_ids:
             wn, sn = f"layers.{bid}.engram.embed.weight", f"layers.{bid}.engram.embed.scale"
-            rows, d = self.model_tensors.pop(wn)().shape
+            wt = self.model_tensors.pop(wn)()
+            rows, d = wt.shape
+            fp4 = wt.dtype == torch.uint8  # NVFP4 repo: MXFP4 rows (2 nibbles/byte); original: float8_e4m3fn rows
+            if fp4:
+                d *= 2
             if d % 32 != 0 or tuple(self.model_tensors.pop(sn)().shape) != (rows, d // 32) or d != (dim or d):
                 raise ValueError(f"{wn}: expected one e8m0 scale per 32 elements and the same width in every layer")
             if rows != self.hparams["engram_num_embeddings"][len(parts)]:
                 raise ValueError(f"{wn}: {rows} rows, config says {self.hparams['engram_num_embeddings'][len(parts)]}")
             dim = d
-            parts.append((wn, sn, rows, self._tensor_part(wn), self._tensor_part(sn)))
+            parts.append((wn, sn, rows, self._tensor_part(wn), self._tensor_part(sn), fp4))
         assert dim is not None
         name = self.format_tensor_name(gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD)
         n_rows = sum(p[2] for p in parts)
 
         def chunks() -> Iterable[np.ndarray]:
             from safetensors import safe_open
-            for wn, sn, rows, wpart, spart in parts:
+            for wn, sn, rows, wpart, spart, fp4 in parts:
                 with safe_open(wpart, framework="pt") as fw, safe_open(spart, framework="pt") as fs:
                     ws, ss = fw.get_slice(wn), fs.get_slice(sn)
                     for r0 in range(0, rows, 1 << 18):
-                        q = ws[r0:r0 + (1 << 18)].view(torch.uint8).reshape(-1, 32)
                         e = ss[r0:r0 + (1 << 18)].view(torch.uint8).reshape(-1, 1)
                         _e8m0_check(e.numpy(), sn)
-                        v = (q.view(torch.float8_e4m3fn).float() * torch.exp2(e.float() - 127)).reshape(-1, dim)
+                        if fp4:
+                            # element 2i in the low nibble, 2i+1 in the high one; e2m1 codes, scale 2^(e8m0 - 127)
+                            b = ws[r0:r0 + (1 << 18)].view(torch.uint8)
+                            codes = torch.stack([b & 0x0F, b >> 4], dim=-1).reshape(-1, 32).long()
+                            v = (_FP4_E2M1[codes] * torch.exp2(e.float() - 127)).reshape(-1, dim)
+                        else:
+                            q = ws[r0:r0 + (1 << 18)].view(torch.uint8).reshape(-1, 32)
+                            v = (q.view(torch.float8_e4m3fn).float() * torch.exp2(e.float() - 127)).reshape(-1, dim)
                         yield (v if self._f32 else v.bfloat16()).view(torch.uint8).numpy()
+        if any(p[5] for p in parts):
+            if not all(p[5] for p in parts):
+                raise ValueError("Engram tables mix MXFP4 and e4m3 rows")
+
+            # MXFP4 source: keep it as ggml MXFP4, bit-exact (no dequantize, 4x smaller than BF16)
+            def mx_chunks() -> Iterable[np.ndarray]:
+                from safetensors import safe_open
+                for wn, sn, rows, wpart, spart, _ in parts:
+                    with safe_open(wpart, framework="pt") as fw, safe_open(spart, framework="pt") as fs:
+                        ws, ss = fw.get_slice(wn), fs.get_slice(sn)
+                        for r0 in range(0, rows, 1 << 18):
+                            e = ss[r0:r0 + (1 << 18)].view(torch.uint8)
+                            _e8m0_check(e.numpy(), sn)
+                            yield self.repack_mxfp4_blocks(ws[r0:r0 + (1 << 18)].view(torch.uint8), e)
+            data = cast(np.ndarray, _StreamedBytes((n_rows, dim // 32 * 17), mx_chunks))
+            self.gguf_writer.add_tensor(name, data, raw_dtype=gguf.GGMLQuantizationType.MXFP4)
+            return
         qt = gguf.GGMLQuantizationType.F32 if self._f32 else gguf.GGMLQuantizationType.BF16
         data = cast(np.ndarray, _StreamedBytes((n_rows, dim * (4 if self._f32 else 2)), chunks))
         self.gguf_writer.add_tensor(name, data, raw_dtype=qt)
 
+    def _generate_nvfp4_tensors(self):
+        """ModelOpt NVFP4 routed experts (layers.N.ffn.experts.E.w{1,2,3}.{weight,weight_scale,weight_scale_2,input_scale}),
+        repacked bit-exactly into ggml NVFP4 and stacked per layer; the per-expert weight_scale_2 / input_scale become
+        [n_expert] F32 ".scale" / ".input_scale" tensors. Everything else (FP8 linears, Engram) is handled as in the
+        MXFP4 checkpoint."""
+        n_expert = self.hparams["n_routed_experts"]
+        for bid in range(self.block_count):
+            for proj, key in (("w1", gguf.MODEL_TENSOR.FFN_GATE_EXP), ("w2", gguf.MODEL_TENSOR.FFN_DOWN_EXP), ("w3", gguf.MODEL_TENSOR.FFN_UP_EXP)):
+                names = [f"layers.{bid}.ffn.experts.{e}.{proj}" for e in range(n_expert)]
+                if names[0] + ".weight_scale" not in self.model_tensors:
+                    continue
+                w = [self.model_tensors.pop(n + ".weight") for n in names]
+                sc = [self.model_tensors.pop(n + ".weight_scale") for n in names]
+                s2 = [self.model_tensors.pop(n + ".weight_scale_2") for n in names]
+                si = [self.model_tensors.pop(n + ".input_scale") for n in names]
+                rows, packed_cols = w[0]().shape
+                if packed_cols % 32 != 0 or tuple(sc[0]().shape) != (rows, packed_cols // 8):
+                    raise ValueError(f"{names[0]}: NVFP4 weight {(rows, packed_cols)} and scale {tuple(sc[0]().shape)} do not match 16-element groups")
+
+                def chunks(w=w, sc=sc) -> Iterable[np.ndarray]:
+                    for wi, sci in zip(w, sc):
+                        raw, _ = self._nvfp4_pack(LazyTorchTensor.to_eager(wi()), LazyTorchTensor.to_eager(sci()))
+                        yield raw
+                n_super = packed_cols * 2 // 64
+                data = cast(np.ndarray, _StreamedBytes((n_expert, rows, n_super * 36), chunks))
+                new_name = self.format_tensor_name(key, bid)
+                self.gguf_writer.add_tensor(new_name, data, raw_dtype=gguf.GGMLQuantizationType.NVFP4)
+                logger.info(f"{new_name}: repacked routed experts to NVFP4, shape = {{{n_expert}, {rows}, {n_super * 64}}}")
+                self._tag_prec_a4(f"layers.{bid}.ffn.experts.{proj}.weight", new_name)
+                self._write_scales_tensor(new_name.replace(".weight", ".scale"), [float(LazyTorchTensor.to_eager(t()).float().sum()) for t in s2])
+                self._write_scales_tensor(new_name.replace(".weight", ".input_scale"), [float(LazyTorchTensor.to_eager(t()).float().sum()) for t in si])
+        self._dsv41_nvfp4_experts = True
+
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         if not self._dsv4_mxfp4_generated:
             for bid in range(self.block_count):
+                if getattr(self, "_dsv41_nvfp4_experts", False):
+                    break
                 self._write_mxfp4_experts(bid, "w1", gguf.MODEL_TENSOR.FFN_GATE_EXP)
                 self._write_mxfp4_experts(bid, "w2", gguf.MODEL_TENSOR.FFN_DOWN_EXP)
                 self._write_mxfp4_experts(bid, "w3", gguf.MODEL_TENSOR.FFN_UP_EXP)
