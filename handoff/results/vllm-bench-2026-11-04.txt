@@ -1,0 +1,13 @@
+# vLLM baseline, this station (GB300), 2026-11-04 04:16 UTC
+# server: container dsv41-vllm-a (vllm/vllm-openai:deepseekv41-flash-0909), DSpark k=5, max-num-seqs 8, port 30006
+# idle before and after (vllm:num_requests_running = 0). command:
+#   python3 handoff/scripts/bench2.py http://127.0.0.1:30006 deepseek-v4.1-flash vllm-dspark
+vllm-dspark short-gen#0: ttft=2.53s gen=192 tok decode=10.8 tok/s
+vllm-dspark short-gen#1: ttft=0.44s gen=192 tok decode=28.3 tok/s
+vllm-dspark short-gen#2: ttft=0.40s gen=191 tok decode=44.2 tok/s
+vllm-dspark SINGLE-STREAM decode median=28.3 tok/s
+vllm-dspark prefill#0: prompt=3746 ttft=6.73s prefill~556 tok/s
+vllm-dspark prefill#1: prompt=3744 ttft=0.94s prefill~3976 tok/s
+vllm-dspark prefill#2: prompt=3744 ttft=0.78s prefill~4787 tok/s
+vllm-dspark 4-concurrent: 512 tok in 5.2s = 99.0 tok/s aggregate, per-stream decode min/median=27.4/28.3
+vllm-dspark 8-concurrent: 1024 tok in 7.0s = 146.6 tok/s aggregate, per-stream decode min/median=19.7/20.6

@@ -136,3 +136,16 @@ How it was copied: one `rsync` stream got only ~25 MB/s on `h-station` (per-conn
 - The 400 GB source checkpoint is only needed to re-convert the GGUF: `hf download nvidia/DeepSeek-V4.1-Flash-1017-NVFP4 --local-dir /data/llm/models/deepseek-v41-flash-1017-nvfp4`.
 
 Correction to earlier chat statements: GPU memory on the GB300 is 256,703 MiB (~251 GiB), not 288 GB.
+
+## 10. vLLM baseline for comparison (added 2026-11-04)
+
+Measured on this station with `handoff/scripts/bench2.py` against the running `dsv41-vllm-a` container (DSpark on, idle server). Raw output: `handoff/results/vllm-bench-2026-11-04.txt`. One run, rough.
+
+| Metric | vLLM + DSpark |
+|---|---|
+| Single-stream decode (192 tokens) | 10.8 / 28.3 / 44.2 tok/s, median 28.3 (first runs were warm-up; steady state is probably higher) |
+| Prefill, ~3.7K tokens, unique prompt each time | 6.7 s, 0.94 s, 0.78 s (~4,000-4,800 tok/s once warm) |
+| 4 concurrent streams | 99 tok/s total (~28 each) |
+| 8 concurrent streams | 147 tok/s total (~20 each) |
+
+Run the same script against the llama.cpp server on `m-station-1` (`bench2.py` gives every prefill prompt a unique prefix, so llama.cpp's prompt cache cannot inflate it either): `python3 handoff/scripts/bench2.py http://127.0.0.1:9494 deepseek-v4.1-flash gguf-ms1`. A copy is at `/opt/llm/var/bench2.py` on `m-station-1`. This comparison favours vLLM: DSpark speculative decoding has no GGUF equivalent here, and the earlier llama.cpp numbers came from a shared box. `bench.py`'s "warm" long-prefill figures are invalid (prompt cache); use `bench2.py` for prefill.
