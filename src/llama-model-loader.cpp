@@ -1595,7 +1595,7 @@ bool llama_model_loader::load_all_data(
     std::vector<void *> host_ptrs;
     size_t buffer_idx = 0; // buffer to use for async loads
     ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
-        if (use_mmap || check_tensors) {
+        if (check_tensors) {
             return nullptr;
         }
         // When not using mmaped io use async uploads from pinned memory to GPU memory.
@@ -1745,6 +1745,18 @@ bool llama_model_loader::load_all_data(
                 auto & mmap_used = mmaps_used[weight->idx];
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+            } else if (upload_backend && !ggml_backend_buffer_is_host(cur->buffer)) {
+                // mmap -> device: copy via pinned staging, pageable cudaMemcpy is very slow
+                size_t done = 0;
+                while (done < n_size) {
+                    const size_t n = std::min<size_t>(buffer_size, n_size - done);
+                    ggml_backend_event_synchronize(events[buffer_idx]);
+                    memcpy(host_ptrs[buffer_idx], data + done, n);
+                    ggml_backend_tensor_set_async(upload_backend, cur, host_ptrs[buffer_idx], done, n);
+                    ggml_backend_event_record(events[buffer_idx], upload_backend);
+                    done += n;
+                    buffer_idx = (buffer_idx + 1) % n_buffers;
+                }
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
             }
