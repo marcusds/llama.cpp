@@ -236,10 +236,11 @@ bool ggml_cuda_mul_mat_id_nvfp4_lt_applicable(const ggml_tensor * dst, const int
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
+    // above 16 tokens: smaller batches stay on MMVQ, from 17 tokens on this beats MMQ (17-32 streams, 30-250 token prompts)
     return enabled && cc >= 1000 && cc < 1100 &&
         src0->type == GGML_TYPE_NVFP4 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
         ggml_get_op_params_i32(dst, 3) != GGML_PREC_Q8 && // Q8 activations requested
-        src1->ne[2] >= 256 && src0->ne[0] % 64 == 0 && src0->ne[1] % 128 == 0 && src0->ne[3] == 1 &&
+        src1->ne[2] > 16 && src0->ne[0] % 64 == 0 && src0->ne[1] % 128 == 0 && src0->ne[3] == 1 &&
         ggml_is_contiguous(src0) && src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float);
 }
 
