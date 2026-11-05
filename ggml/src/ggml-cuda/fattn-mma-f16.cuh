@@ -87,6 +87,13 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     return fattn_mma_config(32, 1, 0, 0, 0, 0, 0, false);
 }
 
+// Datacenter Blackwell (cc 10.x): 227 KiB of shared memory per block allow a larger KV tile.
+static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_blackwell_dc(const int DKQ, const int DV, const int ncols) {
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(512, 512, 64, 256, 1, 128, 256, 256, 128, 1, false);
+
+    return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
+}
+
 static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config_turing(const int DKQ, const int DV, const int ncols) {
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8, 128, 2,  64, 128, 128, 128, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16, 128, 2,  64, 128, 128, 128, 2, true);
@@ -233,6 +240,10 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 
 static __host__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, const int DV, const int ncols, const int cc) {
     if (ampere_mma_available(cc)) {
+        const int arch = ggml_cuda_highest_compiled_arch(cc);
+        if (arch >= 1000 && arch < GGML_CUDA_CC_BLACKWELL) {
+            return ggml_cuda_fattn_mma_get_config_blackwell_dc(DKQ, DV, ncols);
+        }
         return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
     }
     if (turing_mma_available(cc)) {
@@ -249,7 +260,9 @@ static __host__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, c
 }
 
 static constexpr __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, const int DV, const int ncols) {
-#if defined(AMPERE_MMA_AVAILABLE)
+#if defined(AMPERE_MMA_AVAILABLE) && __CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < GGML_CUDA_CC_BLACKWELL
+    return ggml_cuda_fattn_mma_get_config_blackwell_dc(DKQ, DV, ncols);
+#elif defined(AMPERE_MMA_AVAILABLE)
     return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
 #elif defined(TURING_MMA_AVAILABLE)
     return ggml_cuda_fattn_mma_get_config_turing(DKQ, DV, ncols);
