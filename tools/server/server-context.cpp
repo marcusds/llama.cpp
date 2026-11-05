@@ -1866,10 +1866,19 @@ private:
 
         // find an empty slot, or the one that has been least recently used
         if (ret == nullptr) {
-            const auto free_slots = get_free_slots(1, -1);
+            const auto free_slots = get_free_slots(slots.size(), -1);
 
             if (!free_slots.empty()) {
                 ret = free_slots[0];
+
+                // a ubatch needs consecutive seq ids with per-sequence caches (DSV4): prefer a free slot next to a busy one
+                auto is_busy = [&](int id) { return id >= 0 && id < (int) slots.size() && slots[id].is_processing(); };
+                for (server_slot * fs : free_slots) {
+                    if (is_busy(fs->id - 1) || is_busy(fs->id + 1)) {
+                        ret = fs;
+                        break;
+                    }
+                }
 
                 SLT_INF(*ret, "selected slot by LRU, n_tokens = %d, t_last = %" PRId64 "\n", ret->prompt.n_tokens(), ret->t_last_used);
 
