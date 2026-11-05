@@ -10,6 +10,9 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <atomic>
+#include <thread>
+#include <vector>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -898,6 +901,39 @@ void llama_prefetch(llama_memory_ranges mr) {
                 llama_format_win_err(GetLastError()).c_str());
     }
 #else
+    // many ranges (large row gathers): populate the pages from several threads, one madvise per range is slow on one thread
+    if (mr.size() >= 1024) {
+        const unsigned n_thr = std::max(1u, std::min(32u, std::thread::hardware_concurrency()));
+        std::atomic<size_t> next(0);
+        std::atomic<bool> populate_ok(true);
+        auto work = [&]() {
+            const size_t chunk = 64;
+            for (size_t i = next.fetch_add(chunk); i < mr.size(); i = next.fetch_add(chunk)) {
+                for (size_t j = i; j < std::min(i + chunk, mr.size()); ++j) {
+#ifdef MADV_POPULATE_READ
+                    if (populate_ok.load(std::memory_order_relaxed)) {
+                        if (madvise(const_cast<void *>(mr[j].addr), mr[j].size, MADV_POPULATE_READ) == 0) {
+                            continue;
+                        }
+                        if (errno == EINVAL) {
+                            populate_ok = false; // kernel without MADV_POPULATE_READ
+                        }
+                    }
+#endif
+                    madvise(const_cast<void *>(mr[j].addr), mr[j].size, MADV_WILLNEED);
+                }
+            }
+        };
+        std::vector<std::thread> threads;
+        for (unsigned t = 1; t < n_thr; ++t) {
+            threads.emplace_back(work);
+        }
+        work();
+        for (auto & th : threads) {
+            th.join();
+        }
+        return;
+    }
     for (const auto & range : mr) {
         // TODO: in a follow-up, use posix_madvise(.., POSIX_MADV_WILLNEED) to match the rest of this file
         if (madvise(const_cast<void *>(range.addr), range.size, MADV_WILLNEED) != 0) {
