@@ -2,7 +2,10 @@
 
 #include "llama.h"
 
+#include <deque>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <regex>
 #include <string>
 #include <vector>
@@ -42,6 +45,9 @@ enum llama_gretype {
 
     // inverse token (!<[token-id]>)
     LLAMA_GRETYPE_TOKEN_NOT      = 9,
+
+    // non-terminal element: permutation ({| sep : a | b? |}), value is a permutation state id
+    LLAMA_GRETYPE_PERMUTE        = 10,
 };
 
 typedef struct llama_grammar_element {
@@ -68,6 +74,34 @@ using llama_grammar_rules      = std::vector<llama_grammar_rule>;
 using llama_grammar_stacks     = std::vector<llama_grammar_stack>;
 using llama_grammar_candidates = std::vector<llama_grammar_candidate>;
 
+#define LLAMA_GRAMMAR_PERMUTE_MAX_MEMBERS 64
+#define LLAMA_GRAMMAR_PERMUTE_NO_SEP      UINT32_MAX
+
+// members (rule ids) matched in any order, a member at most once unless repeatable, with sep between two picks
+struct llama_grammar_permute {
+    std::vector<uint32_t> members;
+    uint64_t              required   = 0;
+    uint64_t              repeatable = 0;
+    uint32_t              sep        = LLAMA_GRAMMAR_PERMUTE_NO_SEP;
+};
+
+// a state is a permutation plus the mask of picked members, expanded on first use into a rule at a stable address
+struct llama_grammar_permute_states {
+    const std::vector<llama_grammar_permute> permutes;
+
+    explicit llama_grammar_permute_states(std::vector<llama_grammar_permute> permutes);
+
+    const llama_grammar_element * expand(uint32_t state);
+
+private:
+    uint32_t get_state(uint32_t permute, uint64_t mask);
+
+    std::mutex                                        mutex;
+    std::map<std::pair<uint32_t, uint64_t>, uint32_t> ids;
+    std::vector<std::pair<uint32_t, uint64_t>>        keys;
+    std::deque<llama_grammar_rule>                    rules;
+};
+
 // TODO: remove, needed for tests atm
 const llama_grammar_rules  & llama_grammar_get_rules (const struct llama_grammar * grammar);
       llama_grammar_stacks & llama_grammar_get_stacks(      struct llama_grammar * grammar);
@@ -81,13 +115,15 @@ void llama_grammar_accept(struct llama_grammar * grammar, uint32_t chr);
 std::vector<llama_grammar_candidate> llama_grammar_reject_candidates_for_stack(
         const llama_grammar_rules      & rules,
         const llama_grammar_stack      & stack,
-        const llama_grammar_candidates & candidates);
+        const llama_grammar_candidates & candidates,
+        llama_grammar_permute_states   * permutes = nullptr);
 
 struct llama_grammar_parser {
     const llama_vocab * vocab;
     std::map<std::string, uint32_t> symbol_ids;
 
     llama_grammar_rules rules;
+    std::vector<llama_grammar_permute> permutes;
 
     llama_grammar_parser(const struct llama_vocab * vocab = nullptr) : vocab(vocab) {}
 
@@ -110,7 +146,13 @@ struct llama_grammar_parser {
             const std::string  & rule_name,
             llama_grammar_rule & rule,
             bool               is_nested,
-            uint32_t           depth = 0);
+            uint32_t           depth = 0,
+            bool               is_permute_member = false);
+
+    const char * parse_permute(
+            const char        * src,
+            const std::string & rule_name,
+            uint32_t            depth);
 
     const char * parse_rule(const char * src);
 
@@ -150,6 +192,8 @@ struct llama_grammar {
                              trigger_patterns;         // Regular expressions that trigger a lazy grammar. Must be a full match of the entire generated
                                                        // string, and the grammar will be given the string from the first match group onwards.
 
+    // shared by clones: stacks point into the expanded states
+    std::shared_ptr<llama_grammar_permute_states> permutes;
 };
 
 //
