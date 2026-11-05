@@ -341,6 +341,10 @@ extern "C" {
     // `graph` is the compute graph of the split
     typedef bool (*ggml_backend_sched_copy_callback)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst, struct ggml_cgraph * graph, void * user_data);
 
+    // Callback that tells whether the host weight `src` of a split can be copied ahead of the split
+    // `dst` is the copy of `src` in the split, `graph` is the compute graph of the split
+    typedef bool (*ggml_backend_sched_prefetch_callback)(const struct ggml_tensor * src, const struct ggml_tensor * dst, struct ggml_cgraph * graph, void * user_data);
+
     // Callback when the buffers reserved for a graph are not sufficient and have to be reserved again
     // it happens on the graph allocation path and costs a synchronization of the backends
     // `sched` is the scheduler
@@ -389,6 +393,11 @@ extern "C" {
 
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
+
+    // Copy the host weights of the splits ahead of time with the copy callback, called with `backend` (an extra backend
+    // with its own stream), `distance` host weight splits before the split that uses them. The copies get their own
+    // buffers in the compute graph. Needs a copy callback; disabled with distance <= 0
+    GGML_API void                 ggml_backend_sched_set_prefetch(ggml_backend_sched_t sched, ggml_backend_t backend, int distance, ggml_backend_sched_prefetch_callback callback, void * user_data);
 
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);

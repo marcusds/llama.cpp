@@ -5675,6 +5675,12 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
 
 #if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
     cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
+    if (err != cudaSuccess && getenv("PF_TL")) { fprintf(stderr, "PF register failed: %s\n", cudaGetErrorString(err)); }
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        err = cudaHostRegister(buffer, size, cudaHostRegisterPortable);
+        if (err != cudaSuccess && getenv("PF_TL")) { fprintf(stderr, "PF register2 failed: %s\n", cudaGetErrorString(err)); }
+    }
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();

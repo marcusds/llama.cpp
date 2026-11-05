@@ -785,8 +785,9 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
 
     auto inp41 = std::make_unique<llm_graph_input_dsv41>(model, inp_dsv4->mctx);
     // embedding input has no token ids: it skips Engram, like the reference's masked (image) positions
-    // the gathers go right after the token embeddings, so they share the first graph split (the table stays on the host)
-    std::vector<ggml_tensor *> engram_rows;
+    // the gather of a layer is built right before the layer (the table stays on the host), so the device
+    // computes the earlier layers while the host gathers
+    std::vector<ggml_tensor *> engram_ids;
     for (int il = 0; ubatch.token && hparams.ple_n_heads > 0 && il < n_layer; ++il) {
         if (!hparams.is_ple(il)) {
             continue;
@@ -795,12 +796,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         ggml_set_name(ids, ("engram_ids-" + std::to_string(il)).c_str());
         ggml_set_input(ids);
         inp41->engram_ids.push_back(ids);
-
-        ggml_tensor * rows = ggml_get_rows(ctx0, model.per_layer_tok_embd, ids);
-        rows = ggml_reshape_2d(ctx0, rows, hparams.ple_head_dim*hparams.ple_n_heads, n_tokens);
-        cb(rows, "engram_rows", il);
-        ggml_build_forward_expand(gf, rows);
-        engram_rows.push_back(rows);
+        engram_ids.push_back(ids);
     }
     ggml_tensor * engram_keep = nullptr;
     if (hparams.ple_n_heads > 0 && ubatch.token && ubatch.embd) {
@@ -834,8 +830,11 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         const auto & layer = model.layers[il];
 
         const int e = model.engram_index(il);
-        if (e >= 0 && !engram_rows.empty()) {
-            inpL = build_engram(model, inpL, engram_rows[e], engram_keep, il);
+        if (e >= 0 && !engram_ids.empty()) {
+            ggml_tensor * rows = ggml_get_rows(ctx0, model.per_layer_tok_embd, engram_ids[e]);
+            rows = ggml_reshape_2d(ctx0, rows, hparams.ple_head_dim*hparams.ple_n_heads, n_tokens);
+            cb(rows, "engram_rows", il);
+            inpL = build_engram(model, inpL, rows, engram_keep, il);
             cb(inpL, "engram_out", il);
         }
 

@@ -288,6 +288,7 @@ private:
     void sched_new(size_t max_nodes, bool parallel);
 
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
+    static bool sched_can_prefetch(const ggml_tensor * src, const ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
@@ -404,6 +405,11 @@ private:
     int32_t n_reallocs_diff = 0;
 
     ggml_backend_t backend_cpu = nullptr;
+
+    // second stream of the first GPU: copies the host experts of the next layers while the current layer computes
+    ggml_backend_ptr backend_prefetch;
+    int prefetch_dist = 0;
+    std::vector<void *> pinned_host;
     std::vector<ggml_backend_ptr> backends;
 
     // training

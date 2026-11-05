@@ -501,7 +501,7 @@ struct llama_moe_cache::impl {
         }
         const binding & b = it->second;
         const group & g = groups[layers[b.il].ig];
-        if (backend != devices[g.id].backend) {
+        if (ggml_backend_get_device(backend) != ggml_backend_get_device(devices[g.id].backend)) {
             return 0;
         }
 

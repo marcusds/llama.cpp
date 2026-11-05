@@ -611,6 +611,25 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        if (!cparams.pipeline_parallel && !model.devices.empty()) {
+            const char * env = getenv("LLAMA_PREFETCH_DIST");
+            prefetch_dist = env ? atoi(env) : 3;
+            if (prefetch_dist > 0) {
+                backend_prefetch.reset(ggml_backend_dev_init(model.devices[0].dev, nullptr));
+
+                // the copies are only asynchronous from pinned memory
+                auto * reg = ggml_backend_dev_backend_reg(model.devices[0].dev);
+                auto * reg_fn = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer");
+                for (const auto & [name, t] : model.tensors_by_name) {
+                    if (reg_fn && t->buffer && name.find("_exps") != std::string::npos && ggml_backend_buffer_is_host(t->buffer) &&
+                            ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS && reg_fn(t->data, ggml_nbytes(t))) {
+                        pinned_host.push_back(t->data);
+                    }
+                }
+                fprintf(stderr, "PF registered %zu host tensors as pinned memory\n", pinned_host.size());
+            }
+        }
+
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size);
         }
@@ -638,6 +657,14 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    if (!pinned_host.empty()) {
+        auto * reg = ggml_backend_dev_backend_reg(model.devices[0].dev);
+        auto * unreg_fn = (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer");
+        for (void * ptr : pinned_host) {
+            unreg_fn(ptr);
+        }
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.no_alloc() && !opt_ctx) {
@@ -785,6 +812,9 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, parallel, cparams.op_offload));
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+    if (backend_prefetch) {
+        ggml_backend_sched_set_prefetch(sched.get(), backend_prefetch.get(), prefetch_dist, sched_can_prefetch, this);
+    }
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 }
 
@@ -2982,6 +3012,15 @@ ggml_status llama_context::graph_compute(
     return status;
 }
 
+bool llama_context::sched_can_prefetch(const ggml_tensor * /*src*/, const ggml_tensor * dst, ggml_cgraph * graph, void * /*user_data*/) {
+    // large batches use most experts, so the whole tensor is copied without waiting for the router
+    if (ggml_graph_n_nodes(graph) == 0) {
+        return false;
+    }
+    const ggml_tensor * node = ggml_graph_node(graph, 0);
+    return node->op == GGML_OP_MUL_MAT_ID && node->src[0] == dst && node->src[2]->ne[1] >= 2048;
+}
+
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
@@ -2991,6 +3030,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     }
 
     auto & st = lctx->copy_experts;
+    const bool prefetch = backend == lctx->backend_prefetch.get();
 
     // the ids must be computed before the split starts, so only the first node of the split is considered
     if (ggml_graph_n_nodes(graph) == 0) {
@@ -3009,7 +3049,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     const int64_t n_expert    = src->ne[2];
     const size_t  expert_size = src->nb[2];
 
-    if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
+    if (prefetch) {
+        // the ids are not known yet
+        st.used.assign(n_expert, true);
+        st.ids = nullptr;
+    } else if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
         st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
         ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
         ggml_backend_synchronize(backend);
@@ -3026,6 +3070,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         st.ids = ids;
     }
 
+    const int64_t pf_t0 = ggml_time_us();
     // group consecutive experts and copy them together
     for (int64_t first = 0; first < n_expert; ) {
         if (!st.used[first]) {
@@ -3061,6 +3106,10 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         }
 
         first = last + 1;
+    }
+
+    if (getenv("PF_TL")) {
+        fprintf(stderr, "PFTL experts %s prefetch=%d %.2f ms\n", src->name, (int) prefetch, (ggml_time_us() - pf_t0)/1e3);
     }
 
     return true;
