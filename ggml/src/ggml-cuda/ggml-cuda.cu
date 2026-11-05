@@ -337,6 +337,11 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.default_tensor_split[id] = total_vram;
         total_vram += device_vram;
         info.devices[id].integrated = false; // Temporarily disabled due to issues with corrupted output (e.g. #15034)
+        {
+            int ats = 0;
+            CUDA_CHECK(cudaDeviceGetAttribute(&ats, cudaDevAttrPageableMemoryAccessUsesHostPageTables, id));
+            info.devices[id].host_coherent = ats != 0;
+        }
         info.devices[id].nsm        = prop.multiProcessorCount;
         info.devices[id].smpb       = prop.sharedMemPerBlock;
         info.devices[id].warp_size  = prop.warpSize;
@@ -2894,12 +2899,50 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     delete backend;
 }
 
+static __global__ void k_copy_h2d_sm(const int4 * __restrict__ src, int4 * __restrict__ dst, const size_t n) {
+    const size_t stride = (size_t) gridDim.x*blockDim.x;
+    for (size_t i = (size_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += stride) {
+        dst[i] = src[i];
+    }
+}
+
+// large copies from pinned host memory: on coherent systems (cc >= 9.0 with C2C) SM loads through the mapped
+// pointer reach ~1.7x the copy engine bandwidth; same lifetime rules as cudaMemcpyAsync from pinned memory
+static bool ggml_cuda_try_copy_h2d_sm(int device, void * dst, const void * src, size_t size, cudaStream_t stream) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_H2D_SM");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!enabled || size < (1u << 20) || ((uintptr_t) dst | (uintptr_t) src | size) % 16 != 0) {
+        return false;
+    }
+    const ggml_cuda_device_info::cuda_device_info & info = ggml_cuda_info().devices[device];
+    if (!info.host_coherent) {
+        return false;
+    }
+    cudaPointerAttributes attr;
+    if (cudaPointerGetAttributes(&attr, src) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (attr.type != cudaMemoryTypeHost || attr.devicePointer == nullptr) {
+        return false;
+    }
+    const int nblocks = 2*info.nsm;
+    k_copy_h2d_sm<<<nblocks, 512, 0, stream>>>((const int4 *) attr.devicePointer, (int4 *) dst, size/16);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    if (ggml_cuda_try_copy_h2d_sm(cuda_ctx->device, (char *) tensor->data + offset, data, size, cuda_ctx->stream())) {
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
