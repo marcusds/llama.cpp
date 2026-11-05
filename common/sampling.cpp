@@ -143,12 +143,36 @@ struct common_sampler {
 
         if (sampled_probs) {
             const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith(ctx, idx);
+            {
+                const uint32_t nc = llama_get_sampled_candidates_count_ith(ctx, idx);
+                if (nc != sampled_probs_count) {
+                    LOG_WRN("DBG set_logits idx %d: probs %u candidates %u (n_vocab %d)\n", idx, sampled_probs_count, nc, n_vocab);
+                }
+                for (uint32_t i = 0; i < sampled_probs_count; ++i) {
+                    if (sampled_ids[i] < 0 || sampled_ids[i] >= n_vocab) {
+                        LOG_WRN("DBG set_logits idx %d: bad id %d at %u of %u (candidates %u)\n", idx, sampled_ids[i], i, sampled_probs_count, nc);
+                        break;
+                    }
+                }
+            }
             cur.resize(sampled_probs_count);
             for (uint32_t i = 0; i < sampled_probs_count; ++i) {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], sampled_probs[i]};
             }
         } else if (sampled_logits) {
             const uint32_t sampled_logits_count = llama_get_sampled_logits_count_ith(ctx, idx);
+            {
+                const uint32_t nc = llama_get_sampled_candidates_count_ith(ctx, idx);
+                if (nc != sampled_logits_count) {
+                    LOG_WRN("DBG set_logits(logits) idx %d: logits %u candidates %u (n_vocab %d)\n", idx, sampled_logits_count, nc, n_vocab);
+                }
+                for (uint32_t i = 0; i < sampled_logits_count; ++i) {
+                    if (sampled_ids[i] < 0 || sampled_ids[i] >= n_vocab) {
+                        LOG_WRN("DBG set_logits(logits) idx %d: bad id %d at %u of %u (candidates %u)\n", idx, sampled_ids[i], i, sampled_logits_count, nc);
+                        break;
+                    }
+                }
+            }
             cur.resize(sampled_logits_count);
             for (uint32_t i = 0; i < sampled_logits_count; i++) {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
@@ -622,6 +646,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     // return that token id directly.
     {
         id = llama_get_sampled_token_ith(ctx, idx);
+        if (id != LLAMA_TOKEN_NULL && (id < 0 || id >= llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx))))) {
+            LOG_WRN("DBG sample idx %d: backend sampled bad id %d\n", idx, id);
+        }
 
         if (id != LLAMA_TOKEN_NULL) {
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
