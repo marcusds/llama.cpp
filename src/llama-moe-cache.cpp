@@ -232,6 +232,7 @@ struct llama_moe_cache::impl {
 
     int32_t n_expert_used;
 
+    double dstat[3][3] = {}; double diag_plan = 0; double diag_sync = 0, diag_up = 0; long diag_n = 0;
     stats stats_small; // up to 8 tokens per ubatch
     stats stats_large;
     stats stats_copy;  // experts copied from the cache for large batches
@@ -562,14 +563,17 @@ struct llama_moe_cache::impl {
         }
         GGML_ASSERT(ggml_is_contiguous(sel));
 
+        const int64_t td0 = ggml_time_us();
         ids.resize(ggml_nelements(sel));
         ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
         ggml_backend_synchronize(backend);
+        const int64_t td1 = ggml_time_us();
 
         size_t n_hit = 0;
         if (!g.slru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
+        diag_plan += (ggml_time_us() - td1)/1000.0;
 
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
         size_t bytes = 0;
@@ -588,6 +592,13 @@ struct llama_moe_cache::impl {
             }
         }
 
+        {
+            const int64_t td2 = ggml_time_us();
+            diag_sync += (td1 - td0)/1000.0; diag_up += (td2 - td1)/1000.0; diag_n++;
+            { auto & d = ids.size() <= (size_t) 8*n_expert_used ? dstat[0] : ids.size() <= (size_t) 16*n_expert_used ? dstat[1] : dstat[2]; d[0] += n_hit; d[1] += fills.size(); d[2]++; }
+            if (diag_n % 6000 == 0) { for (int k = 0; k < 3; k++) fprintf(stderr, "MOECACHE-DIAG class%d(<=8,<=16,>16 tok) calls=%.0f hit=%.0f miss=%.0f per-call hit/miss %.1f/%.1f\n", k, dstat[k][2], dstat[k][0], dstat[k][1], dstat[k][0]/std::max(1.0, dstat[k][2]), dstat[k][1]/std::max(1.0, dstat[k][2])); }
+            if (diag_n % 6000 == 0) { fprintf(stderr, "MOECACHE-DIAG calls=%ld sync_wait=%.3f ms/call plan+upload=%.3f ms/call (plan only %.3f)\n", diag_n, diag_sync/diag_n, diag_up/diag_n, diag_plan/diag_n); }
+        }
         stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
         st.hits   += n_hit;
         st.misses += fills.size();

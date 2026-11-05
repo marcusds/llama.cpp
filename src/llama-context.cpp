@@ -1,4 +1,7 @@
 #include "llama-context.h"
+#include <map>
+static int g_diag_ntok = 0;
+static double g_diag_sync_ms = 0, g_diag_inp_ms = 0;
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -949,7 +952,9 @@ void llama_context::synchronize() {
         return;
     }
 
+    const int64_t td0 = ggml_time_us();
     ggml_backend_sched_synchronize(sched.get());
+    g_diag_sync_ms += (ggml_time_us() - td0)/1000.0;
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1732,11 +1737,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        const int64_t ti0 = ggml_time_us();
         res->set_inputs(&ubatch);
+        g_diag_inp_ms += (ggml_time_us() - ti0)/1000.0;
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    g_diag_ntok = ubatch.n_tokens;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
@@ -2972,9 +2980,36 @@ ggml_status llama_context::graph_compute(
 
     copy_experts.reset();
 
+    // TIMING-DIAG
+    static const bool diag = getenv("LLAMA_STEP_TIMING") != nullptr;
+    static int64_t t_prev_end = 0;
+    struct bucket { int n = 0; double t_comp = 0, t_gap = 0, t_sync = 0, t_inp = 0; long splits = 0; };
+    static std::map<int, bucket> bk;
+    const int64_t t0 = diag ? ggml_time_us() : 0;
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+    }
+    if (diag) {
+        const int64_t t1 = ggml_time_us();
+        bucket & b = bk[g_diag_ntok > 64 ? 64 : g_diag_ntok];
+        b.n++; b.t_comp += (t1 - t0)/1000.0; b.t_gap += t_prev_end ? (t0 - t_prev_end)/1000.0 : 0;
+        b.splits += ggml_backend_sched_get_n_splits(sched.get());
+        {
+            static FILE * flog = getenv("LLAMA_STEP_LOG") ? fopen(getenv("LLAMA_STEP_LOG"), "w") : nullptr;
+            if (flog) { fprintf(flog, "%lld\t%d\t%.3f\t%.3f\t%.3f\n", (long long) t1, g_diag_ntok, (t1 - t0)/1000.0, t_prev_end ? (t0 - t_prev_end)/1000.0 : 0.0, g_diag_sync_ms); fflush(flog); }
+        }
+        b.t_sync += g_diag_sync_ms; b.t_inp += g_diag_inp_ms; g_diag_sync_ms = 0; g_diag_inp_ms = 0;
+        t_prev_end = t1;
+        static int calls = 0;
+        if (++calls % 300 == 0) {
+            for (auto & kv : bk) {
+                fprintf(stderr, "STEPTIME tok=%d n=%d compute_call=%.2f ms gap_before=%.2f ms (set_inputs %.2f, sync_wait %.2f) splits=%.1f\n", kv.first, kv.second.n,
+                    kv.second.t_comp/kv.second.n, kv.second.t_gap/kv.second.n, kv.second.t_inp/kv.second.n, kv.second.t_sync/kv.second.n, (double) kv.second.splits/kv.second.n);
+            }
+            bk.clear();
+        }
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
@@ -4165,7 +4200,9 @@ void llama_context::opt_epoch_iter(
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
             ggml_opt_alloc(opt_ctx, train);
 
-            res->set_inputs(&ubatch);
+            const int64_t ti0 = ggml_time_us();
+        res->set_inputs(&ubatch);
+        g_diag_inp_ms += (ggml_time_us() - ti0)/1000.0;
             {
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
                 GGML_ASSERT(labels->ne[1] == n_ubatch);

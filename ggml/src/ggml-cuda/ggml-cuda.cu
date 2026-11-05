@@ -2284,14 +2284,12 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return true;
     }
 
-    if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
-        if (ggml_is_quantized(src0->type)) {
-            if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
-                return false;
-            }
-        } else if (GGML_CUDA_CC_IS_AMD(cc)) {
+    if (ggml_is_quantized(src0->type)) {
+        if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
             return false;
         }
+    } else if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_AMD(cc)) {
+        return false;
     }
 
     if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
@@ -2325,19 +2323,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
-        if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
-            if (ggml_is_quantized(src0->type)) {
-                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
-                if (ne2 <= mmvq_mmid_max) {
-                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
-                    return;
-                }
-            } else {
-                if (GGML_CUDA_CC_IS_AMD(cc)) {
-                    ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
-                    return;
-                }
+        if (ggml_is_quantized(src0->type)) {
+            const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+            if (ne2 <= mmvq_mmid_max) {
+                ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+                return;
             }
+        } else if (ne2 <= MMVQ_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_AMD(cc)) {
+            ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
+            return;
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
@@ -4862,6 +4856,49 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+
+// local op timing (GGML_CUDA_OP_TIMING=1, run with GGML_CUDA_DISABLE_GRAPHS=1)
+#include <map>
+#include <string>
+struct ggml_cuda_optime_rec { cudaEvent_t e0, e1; std::string key; };
+static std::vector<ggml_cuda_optime_rec> g_optime_pending;
+static std::vector<cudaEvent_t> g_optime_pool;
+static std::map<std::string, std::pair<double, int>> g_optime_acc;
+static int g_optime_graphs = 0;
+static bool ggml_cuda_optime_on() { static const bool on = getenv("GGML_CUDA_OP_TIMING") != nullptr; return on; }
+static cudaEvent_t ggml_cuda_optime_ev() {
+    if (g_optime_pool.empty()) { cudaEvent_t e; cudaEventCreate(&e); return e; }
+    cudaEvent_t e = g_optime_pool.back(); g_optime_pool.pop_back(); return e;
+}
+static void ggml_cuda_optime_flush(cudaStream_t st) {
+    cudaStreamSynchronize(st);
+    double tot = 0;
+    static cudaEvent_t prev_end = nullptr;
+    if (prev_end != nullptr) {
+        float gap = 0; cudaEventElapsedTime(&gap, prev_end, g_optime_pending.front().e0);
+        auto & a = g_optime_acc["__GAP_between_graphs"]; a.first += gap; a.second++;
+        g_optime_pool.push_back(prev_end);
+    }
+    for (auto & r : g_optime_pending) {
+        float ms = 0; cudaEventElapsedTime(&ms, r.e0, r.e1);
+        auto & a = g_optime_acc[r.key]; a.first += ms; a.second++; tot += ms;
+        g_optime_pool.push_back(r.e0);
+        if (&r != &g_optime_pending.back()) g_optime_pool.push_back(r.e1);
+    }
+    prev_end = g_optime_pending.back().e1;
+    g_optime_pending.clear();
+    g_optime_graphs++;
+    static double acc_tot = 0; acc_tot += tot;
+    if (tot > 100.0 || g_optime_graphs % 100 == 0) {
+        std::vector<std::pair<double, std::string>> v;
+        for (auto & kv : g_optime_acc) v.push_back({kv.second.first, kv.first + " n=" + std::to_string(kv.second.second)});
+        std::sort(v.rbegin(), v.rend());
+        fprintf(stderr, "OPTIME graphs=%d gpu_total_ms=%.1f (last graph %.1f)\n", g_optime_graphs, acc_tot, tot);
+        for (size_t i = 0; i < v.size() && i < 40; i++) fprintf(stderr, "OPTIME  %9.1f ms  %s\n", v[i].first, v[i].second.c_str());
+        g_optime_acc.clear(); acc_tot = 0;
+    }
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -5047,7 +5084,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                ggml_cuda_optime_rec orec;
+                const bool otime = ggml_cuda_optime_on();
+                if (otime) {
+                    orec.e0 = ggml_cuda_optime_ev(); orec.e1 = ggml_cuda_optime_ev();
+                    orec.key = std::string(ggml_op_name(node->op)) + (node->src[0] ? std::string(" ") + ggml_type_name(node->src[0]->type) : "");
+                    if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0] && node->src[1]) {
+                        orec.key += " " + std::to_string(node->src[0]->ne[0]) + "x" + std::to_string(node->src[0]->ne[1]) + " b" + std::to_string(node->src[1]->ne[node->op == GGML_OP_MUL_MAT_ID ? 2 : 1]);
+                    }
+                    cudaEventRecord(orec.e0, cuda_ctx->stream());
+                }
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                if (otime) { cudaEventRecord(orec.e1, cuda_ctx->stream()); g_optime_pending.push_back(orec); }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -5058,6 +5106,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                }
             }
         }
+
+        if (ggml_cuda_optime_on() && !g_optime_pending.empty()) { ggml_cuda_optime_flush(cuda_ctx->stream()); }
 
 #ifdef USE_CUDA_GRAPH
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
