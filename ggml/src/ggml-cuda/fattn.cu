@@ -158,6 +158,13 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
 
+    // DKQ=512 wide tiles (DeepSeek-V4 MQA: window + top-k per query): neighbouring queries share most of their
+    // columns, so the union per tile stays small; gather once each query sees at most half of K
+    if (ncols1 > 1 && Q->ne[0] == 512 && GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc)) {
+        return dst->src[5] == nullptr && mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
+            mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 && K->ne[1] >= 2LL*n_kv_max;
+    }
+
     // the dense kernel handles up to 64/ncols2 queries per K/V pass, the single-query gather has to beat that
     const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1) * (int64_t) n_kv_max;
 
