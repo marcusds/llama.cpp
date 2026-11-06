@@ -158,6 +158,13 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
 
+    // DKQ=512 MQA with all 64 heads of one query per tile: each query reads only its own columns
+    if (ncols2 == 64) {
+        return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && dst->src[5] == nullptr &&
+            mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
+            mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 && K->ne[1] >= 2LL*n_kv_max;
+    }
+
     // the dense kernel handles up to 64/ncols2 queries per K/V pass, the single-query gather has to beat that
     const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1) * (int64_t) n_kv_max;
 
@@ -279,6 +286,14 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
         if (use_gqa_opt && gqa_ratio % 2 == 0) {
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+            return;
+        }
+    }
+
+    // DeepSeek-V4 prefill (MQA, 64 heads, sparse): one query per tile
+    if constexpr (DKQ == 512 && DV == 512) {
+        if (use_gqa_opt && gqa_ratio == 64 && Q->ne[1] > 1 && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1, 64)) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, 64>(ctx, dst);
             return;
         }
     }
