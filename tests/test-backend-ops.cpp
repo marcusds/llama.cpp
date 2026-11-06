@@ -5688,7 +5688,7 @@ struct test_mul_mat_id : public test_case {
         // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) &&
                 !graph_mul_mat_hi_prec_act(gf, GGML_OP_MUL_MAT_ID) &&
-                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+                (backend_has_feature(backend, "BLACKWELL_NATIVE_FP4") || (type_a == GGML_TYPE_NVFP4 && getenv("GGML_CUDA_NVFP4_CUBLASLT")))) {
             return 2e-2;
         }
         if (type_a == GGML_TYPE_F8_E4M3 && backend_has_feature(backend, "NATIVE_FP8")) {
@@ -11475,6 +11475,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 4, 2, true,  64, 16, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_NVFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_NVFP4, GGML_TYPE_F32, 4, 2, true,  64, 16, 256));
+    // large batch, uneven and empty experts (cuBLASLt grouped path)
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 16, 2, false, 256, 300, 512));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 64, 4, true,  256, 300, 512));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 384, 6, false, 2304, 3748, 5120));
+    // small batches just above the MMVQ limit
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 64, 6, false, 256, 17, 512));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 256, 6, false, 512, 40, 1024));
     test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 64, 16, 512));
     test_cases.emplace_back(new test_mul_mat_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 32, 256));
