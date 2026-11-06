@@ -28,46 +28,53 @@ static __device__ __forceinline__ int64_t nvfp4_lt_scale_off(const int row, cons
     return ((int64_t) (row / 128) * ncol_tiles + col / 4) * 512 + (row % 32) * 16 + ((row % 128) / 32) * 4 + col % 4;
 }
 
-// ggml block: 4 scales, then per 16 values 8 bytes with value j in the low and j+8 in the high nibble of byte j
-// cuBLAS: value 2i in the low and 2i+1 in the high nibble of byte i
-static __global__ void k_nvfp4_lt_repack_weights(
+// 8 ggml bytes (value j in the low, j+8 in the high nibble of byte j) -> cuBLAS order (2i low, 2i+1 high)
+static __device__ __forceinline__ uint2 nvfp4_lt_shuffle(const uint32_t a, const uint32_t b) {
+    const uint32_t la = a & 0x0F0F0F0Fu, lb = b & 0x0F0F0F0Fu;
+    const uint32_t ha = (a >> 4) & 0x0F0F0F0Fu, hb = (b >> 4) & 0x0F0F0F0Fu;
+    // the even bytes of x | (x >> 4) hold the nibble pairs
+    return make_uint2(__byte_perm(la | (la >> 4), lb | (lb >> 4), 0x6420), __byte_perm(ha | (ha >> 4), hb | (hb >> 4), 0x6420));
+}
+
+// ggml block: 4 scales then 32 bytes of values; a CUDA block does 128 rows x 4 k-blocks,
+// the scales go through shared memory so each scale tile is written as 512 contiguous bytes
+static __global__ void __launch_bounds__(512) k_nvfp4_lt_repack_weights(
         const char * __restrict__ src, const int32_t * __restrict__ counts, uint8_t * __restrict__ dst_q, uint8_t * __restrict__ dst_s,
         const int64_t N, const int64_t K, const size_t nb01, const size_t nb02) {
-    const int64_t nkb = K / QK_NVFP4;
-    const int64_t i   = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    const int64_t a   = blockIdx.y; // expert, empty experts are skipped
-    if (i >= N * nkb || counts[a] == 0) {
+    const int64_t a = blockIdx.z; // expert, empty experts are skipped
+    if (counts[a] == 0) {
         return;
     }
-    const int64_t kb = i % nkb;
-    const int64_t n  = i / nkb;
+    const int nkb = K / QK_NVFP4;
+    const int kbl = threadIdx.x % 4;
+    const int r   = threadIdx.x / 4;
+    const int kb  = blockIdx.x * 4 + kbl;
+    const int64_t n = (int64_t) blockIdx.y * 128 + r;
 
-    const block_nvfp4 * b = (const block_nvfp4 *) (src + a * nb02 + n * nb01) + kb;
-    const uint32_t d = *(const uint32_t *) b->d;
-    const uint32_t * qs = (const uint32_t *) b->qs;
-
-    uint2 out[4];
+    __shared__ uint32_t sc[4][128];
+    if (kb < nkb) {
+        const uint32_t * p = (const uint32_t *) (src + a * nb02 + n * nb01 + (int64_t) kb * sizeof(block_nvfp4));
+        uint32_t w[9];
 #pragma unroll
-    for (int s = 0; s < 4; ++s) {
-        const uint64_t v = (uint64_t) qs[2*s] | ((uint64_t) qs[2*s + 1] << 32);
-        uint64_t o = 0;
-#pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            const int e0 = 2*j, e1 = 2*j + 1;
-            const uint64_t n0 = (v >> (e0 < 8 ? 8*e0 : 8*(e0 - 8) + 4)) & 0xF;
-            const uint64_t n1 = (v >> (e1 < 8 ? 8*e1 : 8*(e1 - 8) + 4)) & 0xF;
-            o |= (n0 | (n1 << 4)) << (8*j);
+        for (int j = 0; j < 9; ++j) {
+            w[j] = __ldg(p + j);
         }
-        out[s] = make_uint2((uint32_t) o, (uint32_t) (o >> 32));
+        const uint2 o0 = nvfp4_lt_shuffle(w[1], w[2]);
+        const uint2 o1 = nvfp4_lt_shuffle(w[3], w[4]);
+        const uint2 o2 = nvfp4_lt_shuffle(w[5], w[6]);
+        const uint2 o3 = nvfp4_lt_shuffle(w[7], w[8]);
+        uint4 * q = (uint4 *) (dst_q + (a * N + n) * (K / 2) + (int64_t) kb * (QK_NVFP4 / 2));
+        q[0] = make_uint4(o0.x, o0.y, o1.x, o1.y);
+        q[1] = make_uint4(o2.x, o2.y, o3.x, o3.y);
+        // position of row r inside its 128 row scale tile, see nvfp4_lt_scale_off
+        sc[kbl][(r % 32) * 4 + r / 32] = w[0];
     }
-    uint2 * q_dst = (uint2 *) (dst_q + ((a * N + n) * K / 2) + kb * (QK_NVFP4 / 2));
-#pragma unroll
-    for (int s = 0; s < 4; ++s) {
-        q_dst[s] = out[s];
+    __syncthreads();
+    const int c = threadIdx.x / 128;
+    if (blockIdx.x * 4 + c < nkb) {
+        uint32_t * s = (uint32_t *) (dst_s + a * N * (K / 16) + ((int64_t) blockIdx.y * nkb + blockIdx.x * 4 + c) * 512);
+        s[threadIdx.x % 128] = sc[c][threadIdx.x % 128];
     }
-    // the 4 scales of a block are 4 adjacent scale columns
-    uint8_t * s_dst = dst_s + a * N * (K / 16) + nvfp4_lt_scale_off((int) n, (int) kb * 4, (int) nkb);
-    *(uint32_t *) s_dst = d;
 }
 
 static __device__ __forceinline__ uint8_t nvfp4_lt_e2m1(const float x) {
@@ -295,8 +302,8 @@ bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor 
     CUDA_CHECK(cudaGetLastError());
 
     {
-        const int64_t total = N * (K / QK_NVFP4);
-        k_nvfp4_lt_repack_weights<<<dim3((total + 255) / 256, E), 256, 0, stream>>>(
+        const int64_t nkb = K / QK_NVFP4;
+        k_nvfp4_lt_repack_weights<<<dim3((nkb + 3) / 4, N / 128, E), 512, 0, stream>>>(
             (const char *) src0->data, counts, w_q.ptr, w_s.ptr, N, K, src0->nb[1], src0->nb[2]);
         CUDA_CHECK(cudaGetLastError());
     }
