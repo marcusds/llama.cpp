@@ -7838,6 +7838,14 @@ struct test_mul_mat_vec_fusion : public test_case {
         return VARS_TO_STR14(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims, skip);
     }
 
+    double max_nmse_err(ggml_backend_t backend) override {
+        // the cuBLASLt NVFP4 path quantizes the activations to NVFP4, the GLU multiplies two such results
+        if (type == GGML_TYPE_NVFP4 && use_id && m > 16 && getenv("GGML_CUDA_NVFP4_CUBLASLT")) {
+            return 5e-2;
+        }
+        return test_case::max_nmse_err(backend);
+    }
+
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_VEC_FUSION";
@@ -12597,6 +12605,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
+    }
+
+    // NVFP4 gate and up above 16 tokens (cuBLASLt path on cc 10.x), with and without a per-expert scale in between
+    for (bool with_lane_scale : {false, true}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_NVFP4, GGML_GLU_OP_SWIGLU_CLAMP, 64, 256, 256,
+            true, 16, 8, false, false, true, with_lane_scale, {1, 1}));
     }
 
     // Gate and up on the SYCL XMX kernels: rows long enough for 2D block loads, a last tile of 8 rows, and
