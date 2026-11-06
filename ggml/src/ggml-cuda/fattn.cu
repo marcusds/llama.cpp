@@ -160,7 +160,7 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 
     // DKQ=512 wide tiles (DeepSeek-V4 MQA: window + top-k per query): neighbouring queries share most of their
     // columns, so the union per tile stays small; gather once each query sees at most half of K
-    if (ncols1 > 1 && Q->ne[0] == 512 && GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc)) {
+    if ((ncols1 > 1 || ncols2 == 64) && Q->ne[0] == 512 && GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc)) {
         return dst->src[5] == nullptr && mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
             mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 && K->ne[1] >= 2LL*n_kv_max;
     }
@@ -286,6 +286,15 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
         if (use_gqa_opt && gqa_ratio % 2 == 0) {
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+            return;
+        }
+    }
+
+    // DKQ=512 MQA prefill (DeepSeek-V4): all 64 heads of one query per tile, so each query reads exactly its own columns
+    if constexpr (DKQ == 512 && DV == 512) {
+        static const bool fa64 = getenv("GGML_CUDA_FA64") == nullptr || atoi(getenv("GGML_CUDA_FA64")) != 0;
+        if (fa64 && use_gqa_opt && gqa_ratio == 64 && Q->ne[1] > 1 && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1, 64)) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, 64>(ctx, dst);
             return;
         }
     }
