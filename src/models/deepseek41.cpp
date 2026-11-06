@@ -897,7 +897,10 @@ llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
                 LLM_FFN_SILU, hparams.expert_weights_norm && hparams.n_expert_used() > 1,
                 hparams.expert_weights_scale,
                 (llama_expert_gating_func_type) hparams.expert_gating_func,
-                il, logits);
+                il, logits, nullptr,
+                layer.ffn_up_exps_s,        // NVFP4 per-expert scale2 (null for MXFP4 experts)
+                layer.ffn_gate_exps_s,
+                layer.ffn_down_exps_s);
         cb(moe_out, "ffn_moe_out", il);
 
         ggml_tensor * ffn_shexp = build_ffn(cur,
