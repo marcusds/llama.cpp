@@ -13167,6 +13167,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // sparse prefill, DeepSeek-V4 shape (MQA, 64 heads, window + top-k visible per query)
+    for (int64_t nb : {8, 64, 300}) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 1536, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 640));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 1024, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 160));
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -13513,6 +13519,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+
+    // sparse prefill, DeepSeek-V4 shape (MQA, 64 heads, window + top-k visible per query)
+    for (int64_t nb : {64, 512, 2048}) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 5120, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 640));
+    }
 
     // sparse decode at long context
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 49152, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,    0));
