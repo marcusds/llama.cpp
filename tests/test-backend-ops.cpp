@@ -8217,6 +8217,10 @@ struct test_mul_mat_vec_fusion : public test_case {
 
     double max_nmse_err(ggml_backend_t backend) override {
         // 4-bit activations on Blackwell, see test_mul_mat
+        // the cuBLASLt NVFP4 MUL_MAT_ID path (opt-in) also quantizes the activations, the GLU multiplies two such results
+        if (type == GGML_TYPE_NVFP4 && use_id && m > 16 && getenv("GGML_CUDA_NVFP4_CUBLASLT")) {
+            return 5e-2;
+        }
         if (type == GGML_TYPE_NVFP4 && !graph_mul_mat_hi_prec_act(gf, use_id ? GGML_OP_MUL_MAT_ID : GGML_OP_MUL_MAT) &&
                 backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
@@ -12973,6 +12977,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
+    }
+
+    // NVFP4 gate and up above 16 tokens (cuBLASLt path on cc 10.x), with and without a per-expert scale in between
+    for (bool with_lane_scale : {false, true}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_NVFP4, GGML_GLU_OP_SWIGLU_CLAMP, 64, 256, 256,
+            true, 16, 8, false, false, true, with_lane_scale, {1, 1}));
     }
 
     // Gate and up on the SYCL XMX kernels: rows long enough for 2D block loads, a last tile of 8 rows, and

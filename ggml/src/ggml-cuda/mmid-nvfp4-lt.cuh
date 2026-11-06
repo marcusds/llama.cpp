@@ -5,3 +5,7 @@ bool ggml_cuda_mul_mat_id_nvfp4_lt_applicable(const ggml_tensor * dst, int cc);
 
 // returns false when the op cannot be done here (the caller then uses the default path)
 bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// the cached activations of the previous call must not be reused in a new graph
+void ggml_cuda_mul_mat_id_nvfp4_lt_invalidate(ggml_backend_cuda_context & ctx);
+void ggml_cuda_mul_mat_id_nvfp4_lt_free(ggml_backend_cuda_context & ctx);

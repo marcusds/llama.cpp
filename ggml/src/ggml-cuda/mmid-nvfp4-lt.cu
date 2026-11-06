@@ -11,6 +11,7 @@
 #include <cub/block/block_scan.cuh>
 
 #include <algorithm>
+#include <cstring>
 #include <vector>
 
 #define LT_CHECK(x) do { const cublasStatus_t s_ = (x); if (s_ != CUBLAS_STATUS_SUCCESS) { GGML_ABORT("cublasLt error %d in %s", (int) s_, #x); } } while (0)
@@ -251,6 +252,57 @@ bool ggml_cuda_mul_mat_id_nvfp4_lt_applicable(const ggml_tensor * dst, const int
         ggml_is_contiguous(src0) && src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float);
 }
 
+// The quantized activations and the routing of one call, kept for the next call with the same
+// src1 and ids (the gate and up projections of a MoE layer); used once, then invalidated.
+struct nvfp4_lt_act_key {
+    const void * src1, * src1_data, * ids, * ids_data;
+    int64_t v[13];
+    bool operator==(const nvfp4_lt_act_key & o) const {
+        return src1 == o.src1 && src1_data == o.src1_data && ids == o.ids && ids_data == o.ids_data && memcmp(v, o.v, sizeof(v)) == 0;
+    }
+};
+
+struct nvfp4_lt_act_cache {
+    bool valid = false;
+    nvfp4_lt_act_key key = {};
+    int device = -1;
+    // device buffers: counts (3 E int32), sc_off (E int64), pairs, x_q, x_s, row_scale
+    void * buf[6] = {};
+    size_t size[6] = {};
+};
+
+static void * nvfp4_lt_cache_buf(nvfp4_lt_act_cache * c, const int i, const size_t bytes) {
+    if (c->size[i] < bytes) {
+        if (c->buf[i] != nullptr) {
+            CUDA_CHECK(cudaFree(c->buf[i])); // synchronizes, so pending users of the old buffer are done
+        }
+        CUDA_CHECK(cudaMalloc(&c->buf[i], bytes));
+        c->size[i] = bytes;
+    }
+    return c->buf[i];
+}
+
+void ggml_cuda_mul_mat_id_nvfp4_lt_invalidate(ggml_backend_cuda_context & ctx) {
+    if (ctx.nvfp4_lt_cache != nullptr) {
+        ((nvfp4_lt_act_cache *) ctx.nvfp4_lt_cache)->valid = false;
+    }
+}
+
+void ggml_cuda_mul_mat_id_nvfp4_lt_free(ggml_backend_cuda_context & ctx) {
+    nvfp4_lt_act_cache * c = (nvfp4_lt_act_cache *) ctx.nvfp4_lt_cache;
+    if (c == nullptr) {
+        return;
+    }
+    ggml_cuda_set_device(c->device);
+    for (void * b : c->buf) {
+        if (b != nullptr) {
+            CUDA_CHECK(cudaFree(b));
+        }
+    }
+    delete c;
+    ctx.nvfp4_lt_cache = nullptr;
+}
+
 bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -277,28 +329,56 @@ bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor 
     ggml_cuda_pool & pool = ctx.pool();
     ggml_cuda_pool_alloc<uint8_t> w_q(pool, E * N * K / 2);
     ggml_cuda_pool_alloc<uint8_t> w_s(pool, E * N * kb16);
-    ggml_cuda_pool_alloc<uint8_t> x_q(pool, n_pairs * K / 2);
-    ggml_cuda_pool_alloc<uint8_t> x_s(pool, sc_bytes);
     ggml_cuda_pool_alloc<nv_bfloat16> y(pool, n_pairs * N);
-    ggml_cuda_pool_alloc<float> row_scale(pool, n_pairs);
-    ggml_cuda_pool_alloc<nvfp4_lt_pair> pairs_d(pool, n_pairs);
-    ggml_cuda_pool_alloc<int32_t> counts_d(pool, 3 * E); // counts, cursor, row_off
-    ggml_cuda_pool_alloc<int64_t> sc_off_d(pool, E);
     ggml_cuda_pool_alloc<int64_t> meta_d(pool, 14 * E);
     ggml_cuda_pool_alloc<char> work(pool, (size_t(64) << 20) + 256);
     const int64_t G = E;
-    int32_t * counts = counts_d.ptr, * cursor = counts_d.ptr + E, * row_off = counts_d.ptr + 2 * E;
+
+    // the routing and the quantized activations persist across calls only on the main stream
+    const bool use_cache = ctx.curr_stream_no == 0;
+    nvfp4_lt_act_cache * c = nullptr;
+    bool hit = false;
+    if (use_cache) {
+        if (ctx.nvfp4_lt_cache == nullptr) {
+            ctx.nvfp4_lt_cache = new nvfp4_lt_act_cache;
+            ((nvfp4_lt_act_cache *) ctx.nvfp4_lt_cache)->device = ctx.device;
+        }
+        c = (nvfp4_lt_act_cache *) ctx.nvfp4_lt_cache;
+        nvfp4_lt_act_key key = { src1, src1->data, ids, ids->data,
+            { K, E, n_tok, n_used, (int64_t) ids->nb[0], (int64_t) ids->nb[1], (int64_t) src1->nb[1], (int64_t) src1->nb[2], src1->ne[1],
+              (int64_t) dst->nb[1], (int64_t) dst->nb[2], (int64_t) src1->ne[0], 0 } };
+        hit = c->valid && c->key == key;
+        c->valid = !hit; // a hit is used once
+        c->key   = key;
+    }
+    // declared in allocation order, the pool frees in reverse order
+    ggml_cuda_pool_alloc<int32_t> counts_p(pool); // counts, cursor, row_off
+    ggml_cuda_pool_alloc<int64_t> sc_off_p(pool);
+    ggml_cuda_pool_alloc<nvfp4_lt_pair> pairs_p(pool);
+    ggml_cuda_pool_alloc<uint8_t> x_q_p(pool), x_s_p(pool);
+    ggml_cuda_pool_alloc<float> row_scale_p(pool);
+    int32_t       * counts_d  = use_cache ? (int32_t *)       nvfp4_lt_cache_buf(c, 0, 3 * E * sizeof(int32_t))         : counts_p.alloc(3 * E);
+    int64_t       * sc_off_d  = use_cache ? (int64_t *)       nvfp4_lt_cache_buf(c, 1, E * sizeof(int64_t))             : sc_off_p.alloc(E);
+    nvfp4_lt_pair * pairs_d   = use_cache ? (nvfp4_lt_pair *) nvfp4_lt_cache_buf(c, 2, n_pairs * sizeof(nvfp4_lt_pair)) : pairs_p.alloc(n_pairs);
+    uint8_t       * x_q       = use_cache ? (uint8_t *)       nvfp4_lt_cache_buf(c, 3, n_pairs * K / 2)                 : x_q_p.alloc(n_pairs * K / 2);
+    uint8_t       * x_s       = use_cache ? (uint8_t *)       nvfp4_lt_cache_buf(c, 4, sc_bytes)                        : x_s_p.alloc(sc_bytes);
+    float         * row_scale = use_cache ? (float *)         nvfp4_lt_cache_buf(c, 5, n_pairs * sizeof(float))         : row_scale_p.alloc(n_pairs);
+    int32_t * counts = counts_d, * cursor = counts_d + E, * row_off = counts_d + 2 * E;
 
     // no host sync: the expert ids are routed on the device
-    CUDA_CHECK(cudaMemsetAsync(counts_d.ptr, 0, 2 * E * sizeof(int32_t), stream));
-    CUDA_CHECK(cudaMemsetAsync(pairs_d.ptr, 0xFF, n_pairs * sizeof(nvfp4_lt_pair), stream));
-    CUDA_CHECK(cudaMemsetAsync(x_s.ptr, 0, sc_bytes, stream));
     const int nbp = (int) ((n_pairs + 255) / 256);
-    k_nvfp4_lt_count<<<nbp, 256, 0, stream>>>((const char *) ids->data, counts, n_used, ids->nb[0], ids->nb[1], n_pairs, Ei);
-    k_nvfp4_lt_setup<<<1, NVFP4_LT_SETUP_THREADS, 0, stream>>>(counts, row_off, sc_off_d.ptr, meta_d.ptr, Ei, N, K,
-        w_q.ptr, w_s.ptr, x_q.ptr, x_s.ptr, y.ptr);
-    k_nvfp4_lt_place<<<nbp, 256, 0, stream>>>((const char *) ids->data, row_off, sc_off_d.ptr, cursor, pairs_d.ptr, n_used, ids->nb[0], ids->nb[1],
-        n_pairs, Ei, src1->nb[1], src1->nb[2], src1->ne[1], dst->nb[1], dst->nb[2]);
+    if (!hit) {
+        CUDA_CHECK(cudaMemsetAsync(counts_d, 0, 2 * E * sizeof(int32_t), stream));
+        CUDA_CHECK(cudaMemsetAsync(pairs_d, 0xFF, n_pairs * sizeof(nvfp4_lt_pair), stream));
+        CUDA_CHECK(cudaMemsetAsync(x_s, 0, sc_bytes, stream));
+        k_nvfp4_lt_count<<<nbp, 256, 0, stream>>>((const char *) ids->data, counts, n_used, ids->nb[0], ids->nb[1], n_pairs, Ei);
+    }
+    k_nvfp4_lt_setup<<<1, NVFP4_LT_SETUP_THREADS, 0, stream>>>(counts, row_off, sc_off_d, meta_d.ptr, Ei, N, K,
+        w_q.ptr, w_s.ptr, x_q, x_s, y.ptr);
+    if (!hit) {
+        k_nvfp4_lt_place<<<nbp, 256, 0, stream>>>((const char *) ids->data, row_off, sc_off_d, cursor, pairs_d, n_used, ids->nb[0], ids->nb[1],
+            n_pairs, Ei, src1->nb[1], src1->nb[2], src1->ne[1], dst->nb[1], dst->nb[2]);
+    }
     CUDA_CHECK(cudaGetLastError());
 
     {
@@ -307,8 +387,10 @@ bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor 
             (const char *) src0->data, counts, w_q.ptr, w_s.ptr, N, K, src0->nb[1], src0->nb[2]);
         CUDA_CHECK(cudaGetLastError());
     }
-    k_nvfp4_lt_quantize_act<<<n_pairs, 128, 0, stream>>>((const char *) src1->data, pairs_d.ptr, x_q.ptr, x_s.ptr, row_scale.ptr, K);
-    CUDA_CHECK(cudaGetLastError());
+    if (!hit) {
+        k_nvfp4_lt_quantize_act<<<n_pairs, 128, 0, stream>>>((const char *) src1->data, pairs_d, x_q, x_s, row_scale, K);
+        CUDA_CHECK(cudaGetLastError());
+    }
 
     const int64_t * dev = meta_d.ptr;
     void ** pa = (void **) (dev + 9*G);
@@ -347,7 +429,7 @@ bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor 
     const float alpha = 1.0f, beta = 0.0f;
     LT_CHECK(cublasLtMatmul(lt, op, &alpha, pa, lay[0], pb, lay[1], &beta, pd, lay[2], pd, lay[2], &hr.algo, (void *) (((uintptr_t) work.ptr + 255) & ~(uintptr_t) 255), ws, stream));
 
-    k_nvfp4_lt_scatter<<<n_pairs, 256, 0, stream>>>(y.ptr, pairs_d.ptr, row_scale.ptr, (char *) dst->data, N);
+    k_nvfp4_lt_scatter<<<n_pairs, 256, 0, stream>>>(y.ptr, pairs_d, row_scale, (char *) dst->data, N);
     CUDA_CHECK(cudaGetLastError());
 
     // free the cublasLt objects only after the stream is done with the host side arguments
@@ -363,5 +445,7 @@ bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor 
 
 bool ggml_cuda_mul_mat_id_nvfp4_lt_applicable(const ggml_tensor *, int) { return false; }
 bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context &, ggml_tensor *) { return false; }
+void ggml_cuda_mul_mat_id_nvfp4_lt_invalidate(ggml_backend_cuda_context &) {}
+void ggml_cuda_mul_mat_id_nvfp4_lt_free(ggml_backend_cuda_context &) {}
 
 #endif // cuBLASLt grouped FP4 available
