@@ -1795,6 +1795,7 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_u
         const int DKQ, const int DV, const int ncols1, const int ncols2) {
     return (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 8) ||
            (DKQ == 512 && DV == 512 && ncols1 == 8 && ncols2 == 8) ||
+           (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 64) ||
            (DKQ == 576 && DV == 512 && ncols1 == 1 && ncols2 == 16) ||
            (DKQ == 256 && DV == 256 && ncols1 == 1 && ncols2 == 8) ||
            (DKQ == 256 && DV == 256 && ncols1 == 8 && ncols2 == 8);
@@ -2164,6 +2165,7 @@ extern DECL_FATTN_MMA_F16_CASE(512, 512,  4,  4);
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  8,  4);
 extern DECL_FATTN_MMA_F16_CASE(512, 512, 16,  4);
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  1,  8);
+extern DECL_FATTN_MMA_F16_CASE(512, 512,  1, 64);
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  2,  8);
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  4,  8);
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  8,  8);
