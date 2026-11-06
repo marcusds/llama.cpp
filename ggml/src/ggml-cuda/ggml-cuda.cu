@@ -2880,7 +2880,9 @@ static bool ggml_cuda_try_copy_h2d_sm(int device, void * dst, const void * src, 
     if (attr.type != cudaMemoryTypeHost || attr.devicePointer == nullptr) {
         return false;
     }
-    const int nblocks = 2*info.nsm;
+    // C2C saturates at ~48 blocks on GB300; more blocks only take SMs from concurrent kernels
+    static const int nblocks_env = getenv("GGML_CUDA_H2D_SM_BLOCKS") ? atoi(getenv("GGML_CUDA_H2D_SM_BLOCKS")) : 0;
+    const int nblocks = nblocks_env > 0 ? nblocks_env : 2*info.nsm;
     k_copy_h2d_sm<<<nblocks, 512, 0, stream>>>((const int4 *) attr.devicePointer, (int4 *) dst, size/16);
     CUDA_CHECK(cudaGetLastError());
     return true;
