@@ -4150,6 +4150,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // NVFP4 down projection on cuBLASLt: the per-expert scale, the router weights and the sum over the used
+    // experts are applied while reading the GEMM output (MUL_MAT_ID, scale RESHAPE/REPEAT/GET_ROWS/MUL, weighted reduction)
+    if (node->op == GGML_OP_MUL_MAT_ID && i + 5 < cgraph->n_nodes &&
+            ggml_cuda_mul_mat_id_nvfp4_lt_applicable(node, ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        const ggml_tensor * scale = ggml_cuda_get_mul_mat_id_scale(cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3],
+            cgraph->nodes[i + 4], node);
+        ggml_cuda_moe_weighted_reduction_match match;
+        if (scale && cgraph->nodes[i + 1]->op == GGML_OP_RESHAPE && cgraph->nodes[i + 2]->op == GGML_OP_REPEAT &&
+                cgraph->nodes[i + 3]->op == GGML_OP_GET_ROWS && cgraph->nodes[i + 4]->op == GGML_OP_MUL &&
+                ggml_cuda_match_moe_weighted_reduction(cgraph, i + 4, match) &&
+                match.experts == node && match.expert_scale == cgraph->nodes[i + 3] && match.dst->ne[0] == node->ne[0]) {
+            const int n_ops = 4 + match.node_count;
+            std::vector<ggml_op> ops(n_ops);
+            for (int j = 0; j < n_ops; ++j) {
+                ops[j] = cgraph->nodes[i + j]->op;
+            }
+            const int out_idx = i + n_ops - 1;
+            if (ggml_can_fuse_subgraph(cgraph, i, n_ops, ops.data(), &out_idx, 1) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, &out_idx, 1)) {
+                ggml_cuda_nvfp4_lt_epilogue epi;
+                epi.expert_scale = (const float *) scale->data;
+                epi.weights      = (const float *) match.weights->data;
+                epi.out          = match.dst->data;
+                if (ggml_cuda_mul_mat_id_nvfp4_lt(*cuda_ctx, node, &epi)) {
+                    return n_ops - 1;
+                }
+            }
+        }
+    }
+
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {

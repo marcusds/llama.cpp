@@ -239,6 +239,30 @@ static __global__ void k_nvfp4_lt_scatter(
     GGML_UNUSED_VARS(expert_scale, gate, glu_op, glu_limit);
 }
 
+// weighted sum over the used experts of one token, read from the sorted GEMM output (2 columns per thread)
+static __global__ void k_nvfp4_lt_reduce(
+        const nv_bfloat16 * __restrict__ y, const int32_t * __restrict__ inv, const nvfp4_lt_pair * __restrict__ pairs,
+        const float * __restrict__ row_scale, const float * __restrict__ expert_scale, const float * __restrict__ weights,
+        float * __restrict__ dst, const int64_t N, const int64_t n_used) {
+    const int64_t t  = blockIdx.x;
+    const int64_t n2 = (int64_t) blockIdx.y * blockDim.x + threadIdx.x;
+    if (2 * n2 >= N) {
+        return;
+    }
+    float2 acc = make_float2(0.0f, 0.0f);
+    for (int64_t u = 0; u < n_used; ++u) {
+        const int32_t d = inv[t * n_used + u];
+        if (d < 0) {
+            continue; // invalid expert id, contributes nothing
+        }
+        const float  g = row_scale[d] * expert_scale[pairs[d].expert] * weights[t * n_used + u];
+        const float2 v = __bfloat1622float2(((const nv_bfloat162 *) (y + (int64_t) d * N))[n2]);
+        acc.x += v.x * g;
+        acc.y += v.y * g;
+    }
+    ((float2 *) (dst + t * N))[n2] = acc;
+}
+
 // device side routing: count tokens per expert, prefix sums + cuBLASLt group arrays, then place the pairs sorted by expert
 static __global__ void k_nvfp4_lt_count(const char * __restrict__ ids, int32_t * __restrict__ counts,
         const int64_t n_used, const size_t nb0, const size_t nb1, const int64_t n_pairs, const int32_t E) {
@@ -442,7 +466,7 @@ bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor 
         nvfp4_lt_act_key key = { src1, src1->data, ids, ids->data,
             { K, E, n_tok, n_used, (int64_t) ids->nb[0], (int64_t) ids->nb[1], (int64_t) src1->nb[1], (int64_t) src1->nb[2], src1->ne[1],
               (int64_t) dst->nb[1], (int64_t) dst->nb[2], (int64_t) src1->ne[0], 0 } };
-        hit = c->valid && c->key == key;
+        hit = c->valid && c->key == key && !(epi && epi->weights); // the reduction needs this call's pair map
         c->valid = !hit; // a hit is used once
         c->key   = key;
     }
@@ -545,7 +569,11 @@ bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor 
     LT_CHECK(cublasLtMatmul(lt, op, &alpha, pa, lay[0], pb, lay[1], &beta, pd, lay[2], pd, lay[2], &hr.algo, (void *) (((uintptr_t) work.ptr + 255) & ~(uintptr_t) 255), ws, stream));
 
     char * out = epi && epi->out ? (char *) epi->out : (char *) dst->data;
-    if (epi && epi->gate) {
+    if (epi && epi->weights) {
+        GGML_ASSERT(epi->expert_scale && epi->out);
+        k_nvfp4_lt_reduce<<<dim3((unsigned) n_tok, (unsigned) ((N / 2 + 255) / 256)), 256, 0, stream>>>(y.ptr, inv_p.ptr, pairs_d, row_scale,
+            epi->expert_scale, epi->weights, (float *) epi->out, N, n_used);
+    } else if (epi && epi->gate) {
         GGML_ASSERT(epi->expert_scale);
         k_nvfp4_lt_scatter<true, true><<<n_pairs, 256, 0, stream>>>(y.ptr, pairs_d, row_scale, out, N, epi->expert_scale,
             (const char *) epi->gate, epi->glu_op, epi->glu_limit);

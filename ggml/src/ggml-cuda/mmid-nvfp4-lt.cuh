@@ -4,10 +4,13 @@
 bool ggml_cuda_mul_mat_id_nvfp4_lt_applicable(const ggml_tensor * dst, int cc);
 
 // optional output stage: out[i] = glu(gate[i], y[i]*expert_scale[e]) (without gate: y[i]*expert_scale[e]),
-// out and gate have the layout of dst
+// out and gate have the layout of dst. With weights (router weights, [n_used, n_tokens] contiguous) the
+// output is instead the weighted sum over the used experts, out[t] = sum_u weights[t,u]*expert_scale[e]*y[t,u],
+// contiguous [ne0, n_tokens]
 struct ggml_cuda_nvfp4_lt_epilogue {
     const float * expert_scale = nullptr;
     const float * gate         = nullptr;
+    const float * weights      = nullptr;
     ggml_glu_op   glu_op       = GGML_GLU_OP_SWIGLU;
     float         glu_limit    = 0.0f;
     void        * out          = nullptr;
