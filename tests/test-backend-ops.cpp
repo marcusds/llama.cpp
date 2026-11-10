@@ -13197,7 +13197,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     // DSV4_HC_POST: n_tokens 1 is decode, 128 and 512 are prompt batches
-    for (int64_t n_tokens : {1, 128, 512}) {
+    for (int64_t n_tokens : {1, 128, 512, 4096}) {
         test_cases.emplace_back(new test_dsv4_hc_post(4096, n_tokens));             // DeepSeek-V4-Flash
         test_cases.emplace_back(new test_dsv4_hc_post(7168, n_tokens));             // DeepSeek-V4-Pro
         test_cases.emplace_back(new test_dsv4_hc_post(2560, n_tokens, true, true)); // Qwen4-Exp, with the post gate chain
