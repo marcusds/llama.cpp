@@ -1,6 +1,7 @@
 #include "common.cuh"
 
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
+#define MMVQ_MMID_NVFP4_MAX_BATCH_SIZE 16 // Max. MUL_MAT_ID batch for the NVFP4 MoE kernel on cc 10.x.
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 
