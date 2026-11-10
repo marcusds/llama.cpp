@@ -1274,7 +1274,8 @@ const char * const LLM_KV_SPLIT_TENSORS_COUNT = "split.tensors.count";
 // FFN offload utils
 //
 
-const char * const LLM_FFN_EXPS_REGEX = "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
+// only the expert weights: their small per-expert scales and biases stay with the layer
+const char * const LLM_FFN_EXPS_REGEX = "\\.ffn_(up|down|gate|gate_up)_(ch|)exps\\.weight";
 
 const char * const LLM_FFN_DENSE_REGEX = "\\.ffn_(up|down|gate)\\.";
 
