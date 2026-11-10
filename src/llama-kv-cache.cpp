@@ -1732,6 +1732,10 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * 
 
         const int32_t * rows = rows_all ? rows_all + s*n_kv : nullptr;
 
+        // position of each recorded cell of a sequence, or pos_none if the cell is not visible to the sequence
+        constexpr llama_pos pos_none = std::numeric_limits<llama_pos>::min();
+        std::unordered_map<llama_seq_id, std::vector<llama_pos>> seq_idxs_pos;
+
         // one mask row; prev: start from the first row of the sequence (srct) and update only its cells in idxs
         auto do_row = [&](const uint32_t ii, const bool prev, const uint32_t srct, std::vector<uint32_t> & idxs) {
             const uint32_t i = s*n_tps + ii;
@@ -1762,6 +1766,21 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * 
                 const uint64_t idst_prev = n_kv*srct;
 
                 std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
+
+                // the recorded cells with their positions looked up once per sequence
+                if (!is_2d) {
+                    const std::vector<llama_pos> & idxs_pos = seq_idxs_pos.at(seq_id);
+                    for (size_t k = 0; k < idxs.size(); ++k) {
+                        const llama_pos p0c = idxs_pos[k];
+                        bool keep = p0c != pos_none && (!causal || p0c <= p1);
+                        if (keep && swa) {
+                            const bool in_span = !causal && args.hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_FULL && p0c >= seq_pos_min[seq_id];
+                            keep = in_span || !llama_hparams::is_masked_swa(n_swa, swa_type, p0c, p1);
+                        }
+                        data[idst + idxs[k]] = keep ? mask_keep : mask_drop;
+                    }
+                    return;
+                }
             }
 
             for (uint32_t jj = 0; jj < n_kv; ++jj) {
@@ -1855,6 +1874,19 @@ skip:
                 seq_srct[seq_id] = s*n_tps + ii;
             }
             do_row(ii, false, 0, idxs);
+        }
+
+        if (!alibi && !is_2d) {
+            for (const auto & it : seq_idxs) {
+                const auto & cells = v_cells.at(seq_to_stream[it.first]);
+                std::vector<llama_pos> & idxs_pos = seq_idxs_pos[it.first];
+                idxs_pos.resize(it.second.size());
+                for (size_t k = 0; k < it.second.size(); ++k) {
+                    const uint32_t c = it.second[k];
+                    const int32_t  j = rows ? rows[c] : (int32_t) c;
+                    idxs_pos[k] = j < 0 || cells.is_empty(j) || !cells.seq_has(j, it.first) ? pos_none : cells.pos_get(j);
+                }
+            }
         }
 
         auto do_rest = [&](const size_t r0, const size_t r1) {
