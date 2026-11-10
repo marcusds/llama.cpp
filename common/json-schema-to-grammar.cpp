@@ -767,6 +767,19 @@ private:
             return "\"{\" space \"}\"";
         }
 
+        // the grammar engine allows at most 64 permutation members
+        const size_t n_members = prop_names.size() + (additional_properties ? 1 : 0);
+        if (n_members >= 2 && n_members <= 64) {
+            std::string rule = "\"{\" space {| \",\" space :";
+            for (size_t i = 0; i < prop_names.size(); i++) {
+                rule += (i > 0 ? " | " : " ") + prop_kv_rule_names[prop_names[i]] + (required.count(prop_names[i]) ? "" : "?");
+            }
+            if (additional_properties) {
+                rule += " | " + prop_kv_rule_names["*"] + "*";
+            }
+            return rule + " |} space \"}\"";
+        }
+
         std::string rule = "\"{\" space ";
         for (size_t i = 0; i < required_props.size(); i++) {
             if (i > 0) {

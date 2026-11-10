@@ -18,6 +18,7 @@ static const char * type_str(llama_gretype type) {
         case LLAMA_GRETYPE_RULE_REF: return "LLAMA_GRETYPE_RULE_REF";
         case LLAMA_GRETYPE_ALT: return "LLAMA_GRETYPE_ALT";
         case LLAMA_GRETYPE_END: return "LLAMA_GRETYPE_END";
+        case LLAMA_GRETYPE_PERMUTE: return "LLAMA_GRETYPE_PERMUTE";
         default: return "?";
     }
 }
@@ -137,6 +138,41 @@ static void verify_failure(const char * grammar_bytes) {
     llama_grammar_parser result;
     result.parse(grammar_bytes);
     assert(result.rules.empty() && "should have failed");
+}
+
+static std::string print_grammar(llama_grammar_parser & parsed_grammar) {
+    FILE * file = tmpfile();
+    parsed_grammar.print(file);
+    std::string result(ftell(file), '\0');
+    rewind(file);
+    result.resize(fread(result.data(), 1, result.size(), file));
+    fclose(file);
+    return result;
+}
+
+static void verify_permute(const char * grammar_bytes, const std::vector<llama_grammar_permute> & expected, const std::string & expected_print) {
+    fprintf(stderr, "Testing permutation:%s\n", grammar_bytes);
+    llama_grammar_parser parsed_grammar;
+    assert(parsed_grammar.parse(grammar_bytes));
+
+    const std::string printed = print_grammar(parsed_grammar);
+    bool matches = parsed_grammar.permutes.size() == expected.size() && printed == expected_print;
+    for (size_t i = 0; matches && i < expected.size(); i++) {
+        const auto & perm = parsed_grammar.permutes[i];
+        matches = perm.members == expected[i].members && perm.required == expected[i].required &&
+                  perm.repeatable == expected[i].repeatable && perm.sep == expected[i].sep;
+    }
+    if (!matches) {
+        for (const auto & perm : parsed_grammar.permutes) {
+            fprintf(stderr, "members:");
+            for (const uint32_t member : perm.members) {
+                fprintf(stderr, " %u", member);
+            }
+            fprintf(stderr, " required: %llu repeatable: %llu sep: %u\n", (unsigned long long) perm.required, (unsigned long long) perm.repeatable, perm.sep);
+        }
+        fprintf(stderr, "expected:\n%s\nactual:\n%s\n", expected_print.c_str(), printed.c_str());
+        assert(false);
+    }
 }
 
 int main()
@@ -579,6 +615,122 @@ int main()
         {LLAMA_GRETYPE_ALT, 0},
         {LLAMA_GRETYPE_END, 0},
     });
+
+    verify_parsing(R"""(
+        root ::= {| "," : a | b? | c* | d+ |}
+        a ::= "a"
+        b ::= "b"
+        c ::= "c"
+        d ::= "d"
+    )""", {
+        {"a", 2},
+        {"b", 3},
+        {"c", 4},
+        {"d", 5},
+        {"root", 0},
+        {"root_1", 1},
+    }, {
+        // root (index 0)
+        {LLAMA_GRETYPE_PERMUTE, 0},
+        {LLAMA_GRETYPE_END, 0},
+        // root_1 (index 1)
+        {LLAMA_GRETYPE_CHAR, ','},
+        {LLAMA_GRETYPE_END, 0},
+        // a (index 2)
+        {LLAMA_GRETYPE_CHAR, 'a'},
+        {LLAMA_GRETYPE_END, 0},
+        // b (index 3)
+        {LLAMA_GRETYPE_CHAR, 'b'},
+        {LLAMA_GRETYPE_END, 0},
+        // c (index 4)
+        {LLAMA_GRETYPE_CHAR, 'c'},
+        {LLAMA_GRETYPE_END, 0},
+        // d (index 5)
+        {LLAMA_GRETYPE_CHAR, 'd'},
+        {LLAMA_GRETYPE_END, 0},
+    });
+
+    verify_permute(R"""(
+        root ::= "{" {| "," : a | b? | c* | d+ |} "}"
+        a ::= "a"
+        b ::= "b"
+        c ::= "c"
+        d ::= "d"
+    )""", {
+        {{2, 3, 4, 5}, 0b1001, 0b1100, 1},
+    },
+        "root ::= [{] {| root_1 : a | b? | c* | d+ |} [}] \n"
+        "root_1 ::= [,] \n"
+        "a ::= [a] \n"
+        "b ::= [b] \n"
+        "c ::= [c] \n"
+        "d ::= [d] \n");
+
+    verify_permute(R"""(
+        root ::= {| ("a")? | "b"* "c" | "d" "e" |}
+    )""", {
+        {{1, 3, 4}, 0b110, 0, LLAMA_GRAMMAR_PERMUTE_NO_SEP},
+    },
+        "root ::= {| root_1? | root_3 | root_4 |} \n"
+        "root_1 ::= [a] \n"
+        "root_2 ::= [b] root_2 | \n"
+        "root_3 ::= root_2 [c] \n"
+        "root_4 ::= [d] [e] \n");
+
+    verify_permute(R"""(
+        root ::= {| "," " "? : "x" | {| ";" : "y" | "z"? |}* |} ("!" {| "a" | "b" |}){2}
+    )""", {
+        {{5, 6}, 0b01, 0, 4},
+        {{3, 7}, 0b01, 0b10, 2},
+        {{9, 10}, 0b11, 0, LLAMA_GRAMMAR_PERMUTE_NO_SEP},
+    },
+        "root ::= {| root_2 : root_3 | root_7* |} root_8 root_8 \n"
+        "root_1 ::= [ ] | \n"
+        "root_2 ::= [,] root_1 \n"
+        "root_3 ::= [x] \n"
+        "root_4 ::= [;] \n"
+        "root_5 ::= [y] \n"
+        "root_6 ::= [z] \n"
+        "root_7 ::= {| root_4 : root_5 | root_6? |} \n"
+        "root_8 ::= [!] {| root_9 | root_10 |} \n"
+        "root_9 ::= [a] \n"
+        "root_10 ::= [b] \n");
+
+    verify_failure(R"""(
+        root ::= {| |}
+    )""");
+
+    verify_failure(R"""(
+        root ::= {| "," : |}
+    )""");
+
+    verify_failure(R"""(
+        root ::= {| "a" | |}
+    )""");
+
+    verify_failure(R"""(
+        root ::= {| "a" | "b"
+    )""");
+
+    verify_failure(R"""(
+        root ::= {| "a" | "b" }
+    )""");
+
+    verify_failure(R"""(
+        root ::= {| "a" | missing |}
+    )""");
+
+    verify_failure(R"""(
+        root ::= {| missing : "a" | "b" |}
+    )""");
+
+    {
+        std::string grammar = "root ::= {| ";
+        for (int i = 0; i < 65; i++) {
+            grammar += (i > 0 ? " | \"" : "\"") + std::to_string(i) + "\"";
+        }
+        verify_failure((grammar + " |}").c_str());
+    }
 
     // <[1000]> = "<think>"
     // <[1001]> = "</think>"

@@ -268,11 +268,13 @@ static void print_rule_binary(FILE * file, const llama_grammar_rule & rule) {
             case LLAMA_GRETYPE_CHAR_ANY:       fprintf(file, "CHAR_ANY");       break;
             case LLAMA_GRETYPE_TOKEN:          fprintf(file, "TOKEN");          break;
             case LLAMA_GRETYPE_TOKEN_NOT:      fprintf(file, "TOKEN_NOT");      break;
+            case LLAMA_GRETYPE_PERMUTE:        fprintf(file, "PERMUTE");        break;
         }
         switch (elem.type) {
             case LLAMA_GRETYPE_END:
             case LLAMA_GRETYPE_ALT:
             case LLAMA_GRETYPE_RULE_REF:
+            case LLAMA_GRETYPE_PERMUTE:
                 fprintf(file, "(%u) ", elem.value);
                 break;
             case LLAMA_GRETYPE_CHAR:
@@ -304,7 +306,8 @@ static void print_rule(
         FILE     * file,
         uint32_t   rule_id,
         const llama_grammar_rule & rule,
-        const std::map<uint32_t, std::string> & symbol_id_names) {
+        const std::map<uint32_t, std::string> & symbol_id_names,
+        const std::vector<llama_grammar_permute> & permutes) {
     if (rule.empty() || rule.back().type != LLAMA_GRETYPE_END) {
         throw std::runtime_error(
             "malformed rule, does not end with LLAMA_GRETYPE_END: " + std::to_string(rule_id));
@@ -361,6 +364,22 @@ static void print_rule(
                 fprintf(file, "<[");
                 fprintf(file, "%u", elem.value);
                 fprintf(file, "]> ");
+                break;
+            case LLAMA_GRETYPE_PERMUTE:
+                {
+                    const llama_grammar_permute & perm = permutes.at(elem.value);
+                    fprintf(file, "{| ");
+                    if (perm.sep != LLAMA_GRAMMAR_PERMUTE_NO_SEP) {
+                        fprintf(file, "%s : ", symbol_id_names.at(perm.sep).c_str());
+                    }
+                    for (size_t j = 0; j < perm.members.size(); j++) {
+                        const uint64_t bit      = uint64_t(1) << j;
+                        const bool     required = perm.required & bit;
+                        const char *   modifier = perm.repeatable & bit ? (required ? "+" : "*") : (required ? "" : "?");
+                        fprintf(file, "%s%s%s ", j > 0 ? "| " : "", symbol_id_names.at(perm.members[j]).c_str(), modifier);
+                    }
+                    fprintf(file, "|} ");
+                }
                 break;
         }
         if (is_char_element(elem)) {
@@ -461,7 +480,8 @@ const char * llama_grammar_parser::parse_sequence(
         const std::string  & rule_name,
         llama_grammar_rule & rule,
         bool               is_nested,
-        uint32_t           depth) {
+        uint32_t           depth,
+        bool               is_permute_member) {
     size_t last_sym_start = rule.size();
     const char * pos = src;
     uint64_t n_prev_rules = 1;
@@ -615,11 +635,24 @@ const char * llama_grammar_parser::parse_sequence(
                 throw std::runtime_error(std::string("expecting ')' at ") + pos);
             }
             pos = parse_space(pos + 1, is_nested);
+        } else if (pos[0] == '{' && pos[1] == '|') { // permutation
+            if (depth >= GRAMMAR_RECURSIVE_LIMIT) {
+                throw std::runtime_error("grammar recursion depth limit exceeded (max " + std::to_string(GRAMMAR_RECURSIVE_LIMIT) + "), please reduce nesting depth");
+            }
+            uint32_t n_rules_before = symbol_ids.size();
+            pos = parse_permute(pos + 2, rule_name, depth + 1);
+            n_prev_rules = std::max(1u, (uint32_t)symbol_ids.size() - n_rules_before);
+            last_sym_start = rule.size();
+            rule.push_back({LLAMA_GRETYPE_PERMUTE, (uint32_t)permutes.size() - 1});
+            pos = parse_space(pos, is_nested);
         } else if (*pos == '.') { // any char
             last_sym_start = rule.size();
             n_prev_rules = 1;
             rule.push_back({LLAMA_GRETYPE_CHAR_ANY, 0});
             pos = parse_space(pos + 1, is_nested);
+        } else if (is_permute_member && (*pos == '*' || *pos == '+' || *pos == '?') && *parse_space(pos + 1, true) == '|') {
+            // member quantifier, handled by parse_permute
+            break;
         } else if (*pos == '*') {
             pos = parse_space(pos + 1, is_nested);
             handle_repetitions(0, -1);
@@ -674,6 +707,67 @@ const char * llama_grammar_parser::parse_sequence(
     return pos;
 }
 
+const char * llama_grammar_parser::parse_permute(
+        const char        * src,
+        const std::string & rule_name,
+        uint32_t            depth) {
+    llama_grammar_permute perm;
+
+    auto parse_part = [&](const char * pos, uint32_t & part_id) {
+        llama_grammar_rule part;
+        pos = parse_sequence(pos, rule_name, part, true, depth, true);
+        if (part.empty()) {
+            part_id = LLAMA_GRAMMAR_PERMUTE_NO_SEP;
+        } else if (part.size() == 1 && part[0].type == LLAMA_GRETYPE_RULE_REF) {
+            part_id = part[0].value;
+        } else {
+            part_id = generate_symbol_id(rule_name);
+            part.push_back({LLAMA_GRETYPE_END, 0});
+            add_rule(part_id, part);
+        }
+        return pos;
+    };
+
+    uint32_t part_id;
+    const char * pos = parse_part(parse_space(src, true), part_id);
+    if (*pos == ':') {
+        perm.sep = part_id;
+        pos = parse_part(parse_space(pos + 1, true), part_id);
+    }
+
+    while (true) {
+        if (part_id == LLAMA_GRAMMAR_PERMUTE_NO_SEP) {
+            throw std::runtime_error(std::string("expecting permutation member at ") + pos);
+        }
+        if (perm.members.size() == LLAMA_GRAMMAR_PERMUTE_MAX_MEMBERS) {
+            throw std::runtime_error("too many permutation members (max " + std::to_string(LLAMA_GRAMMAR_PERMUTE_MAX_MEMBERS) + ")");
+        }
+        const uint64_t bit = uint64_t(1) << perm.members.size();
+        perm.members.push_back(part_id);
+        const char quantifier = (*pos == '?' || *pos == '*' || *pos == '+') ? *pos : 0;
+        if (quantifier != '?' && quantifier != '*') {
+            perm.required |= bit;
+        }
+        if (quantifier == '*' || quantifier == '+') {
+            perm.repeatable |= bit;
+        }
+        if (quantifier) {
+            pos = parse_space(pos + 1, true);
+        }
+        if (pos[0] == '|' && pos[1] == '}') {
+            pos += 2;
+            break;
+        }
+        if (*pos != '|') {
+            throw std::runtime_error(std::string("expecting '|' or '|}' at ") + pos);
+        }
+        pos = parse_part(parse_space(pos + 1, true), part_id);
+    }
+
+    permutes.push_back(std::move(perm));
+    return pos;
+}
+
 const char * llama_grammar_parser::parse_rule(const char * src) {
     const char * name_end = parse_name(src);
     const char * pos      = parse_space(name_end, false);
@@ -705,27 +799,39 @@ bool llama_grammar_parser::parse(const char * src) {
             pos = parse_rule(pos);
         }
         // Validate the state to ensure that all rules are defined
+        auto check_rule_id = [&](uint32_t rule_id) {
+            // Ensure that the rule at that location exists
+            if (rule_id >= rules.size() || rules[rule_id].empty()) {
+                // Get the name of the rule that is missing
+                for (const auto & kv : symbol_ids) {
+                    if (kv.second == rule_id) {
+                        throw std::runtime_error("Undefined rule identifier '" + kv.first + "'");
+                    }
+                }
+            }
+        };
         for (const auto & rule : rules) {
             if (rule.empty()) {
                 throw std::runtime_error("Undefined rule");
             }
             for (const auto & elem : rule) {
                 if (elem.type == LLAMA_GRETYPE_RULE_REF) {
-                    // Ensure that the rule at that location exists
-                    if (elem.value >= rules.size() || rules[elem.value].empty()) {
-                        // Get the name of the rule that is missing
-                        for (const auto & kv : symbol_ids) {
-                            if (kv.second == elem.value) {
-                                throw std::runtime_error("Undefined rule identifier '" + kv.first + "'");
-                            }
-                        }
-                    }
+                    check_rule_id(elem.value);
                 }
+            }
+        }
+        for (const auto & perm : permutes) {
+            for (const uint32_t member : perm.members) {
+                check_rule_id(member);
+            }
+            if (perm.sep != LLAMA_GRAMMAR_PERMUTE_NO_SEP) {
+                check_rule_id(perm.sep);
             }
         }
     } catch (const std::exception & err) {
         fprintf(stderr, "%s: error parsing grammar: %s\n\n%s\n", __func__, err.what(), src);
         rules.clear();
+        permutes.clear();
         return false;
     }
 
@@ -741,7 +847,7 @@ void llama_grammar_parser::print(FILE * file) {
         for (size_t i = 0, end = rules.size(); i < end; i++) {
             // fprintf(file, "%zu: ", i);
             // print_rule_binary(file, rules[i]);
-            print_rule(file, uint32_t(i), rules[i], symbol_id_names);
+            print_rule(file, uint32_t(i), rules[i], symbol_id_names, permutes);
             // fprintf(file, "\n");
         }
     } catch (const std::exception & err) {
@@ -756,6 +862,54 @@ llama_grammar_stack llama_grammar_parser::c_rules() const {
         ret.push_back(rule.data());
     }
     return ret;
+}
+
+llama_grammar_permute_states::llama_grammar_permute_states(std::vector<llama_grammar_permute> permutes) : permutes(std::move(permutes)) {
+    // state i is permutation i with nothing picked, as referenced by the grammar rules
+    for (uint32_t i = 0; i < this->permutes.size(); i++) {
+        get_state(i, 0);
+    }
+}
+
+uint32_t llama_grammar_permute_states::get_state(uint32_t permute, uint64_t mask) {
+    auto result = ids.emplace(std::make_pair(permute, mask), (uint32_t)keys.size());
+    if (result.second) {
+        keys.emplace_back(permute, mask);
+        rules.emplace_back();
+    }
+    return result.first->second;
+}
+
+const llama_grammar_element * llama_grammar_permute_states::expand(uint32_t state) {
+    std::lock_guard<std::mutex> lock(mutex);
+    GGML_ASSERT(state < rules.size());
+
+    if (rules[state].empty()) {
+        const auto [permute, mask] = keys[state];
+        const llama_grammar_permute & perm = permutes[permute];
+
+        llama_grammar_rule rule;
+        for (size_t i = 0; i < perm.members.size(); i++) {
+            const uint64_t bit = uint64_t(1) << i;
+            if ((mask & bit) && !(perm.repeatable & bit)) {
+                continue;
+            }
+            if (mask != 0 && perm.sep != LLAMA_GRAMMAR_PERMUTE_NO_SEP) {
+                rule.push_back({LLAMA_GRETYPE_RULE_REF, perm.sep});
+            }
+            rule.push_back({LLAMA_GRETYPE_RULE_REF, perm.members[i]});
+            rule.push_back({LLAMA_GRETYPE_PERMUTE, get_state(permute, mask | bit)});
+            rule.push_back({LLAMA_GRETYPE_ALT, 0});
+        }
+        if ((mask & perm.required) != perm.required) {
+            // no empty alternate while a required member is left
+            rule.pop_back();
+        }
+        rule.push_back({LLAMA_GRETYPE_END, 0});
+        rules[state] = std::move(rule);
+    }
+
+    return rules[state].data();
 }
 
 // returns true iff pos points to the end of one of the definitions of a rule
@@ -865,9 +1019,10 @@ static bool llama_grammar_match_token(
 // transforms a grammar pushdown stack into N possible stacks, all ending
 // at a character range (terminal element)
 static void llama_grammar_advance_stack(
-        const llama_grammar_rules  & rules,
-        const llama_grammar_stack  & stack,
-        llama_grammar_stacks & new_stacks) {
+        const llama_grammar_rules    & rules,
+        llama_grammar_permute_states * permutes,
+        const llama_grammar_stack    & stack,
+        llama_grammar_stacks         & new_stacks) {
     std::vector<llama_grammar_stack> todo;
     todo.push_back(stack);
 
@@ -901,9 +1056,15 @@ static void llama_grammar_advance_stack(
         const llama_grammar_element * pos = curr_stack.back();
 
         switch (pos->type) {
-        case LLAMA_GRETYPE_RULE_REF: {
-            const size_t                  rule_id = static_cast<size_t>(pos->value);
-            const llama_grammar_element * subpos  = rules[rule_id].data();
+        case LLAMA_GRETYPE_RULE_REF:
+        case LLAMA_GRETYPE_PERMUTE: {
+            const llama_grammar_element * subpos = nullptr;
+            if (pos->type == LLAMA_GRETYPE_RULE_REF) {
+                subpos = rules[static_cast<size_t>(pos->value)].data();
+            } else {
+                GGML_ASSERT(permutes != nullptr);
+                subpos = permutes->expand(pos->value);
+            }
             do {
                 // init new stack without the top (pos)
                 llama_grammar_stack next_stack(curr_stack.begin(), curr_stack.end() - 1);
@@ -950,6 +1111,7 @@ static void llama_grammar_advance_stack(
 
 static bool llama_grammar_detect_left_recursion(
         const llama_grammar_rules & rules,
+        const std::vector<llama_grammar_permute> & permutes,
         size_t rule_index,
         std::vector<bool> * rules_visited,
         std::vector<bool> * rules_in_progress,
@@ -983,15 +1145,43 @@ static bool llama_grammar_detect_left_recursion(
 
     // Second, recurse into leftmost nonterminals (or next-leftmost as long as the previous nonterminal may
     // be empty)
+    auto detect = [&](uint32_t ref_rule_id) {
+        return llama_grammar_detect_left_recursion(rules, permutes, ref_rule_id, rules_visited, rules_in_progress, rules_may_be_empty, depth + 1);
+    };
+
     bool recurse_into_nonterminal = true;
     for (size_t i = 0; i < rule.size(); i++) {
         if (rule[i].type == LLAMA_GRETYPE_RULE_REF && recurse_into_nonterminal) {
-            if (llama_grammar_detect_left_recursion(rules, (size_t)rule[i].value, rules_visited, rules_in_progress, rules_may_be_empty, depth + 1)) {
+            if (detect(rule[i].value)) {
                 return true;
             }
             if (!((*rules_may_be_empty)[(size_t)rule[i].value])) {
                 recurse_into_nonterminal = false;
             }
+        } else if (rule[i].type == LLAMA_GRETYPE_PERMUTE && recurse_into_nonterminal) {
+            // any member can come first, and the separator too after a member that may be empty
+            const llama_grammar_permute & perm = permutes.at(rule[i].value);
+            bool any_member_may_be_empty       = false;
+            bool required_members_may_be_empty = true;
+            for (size_t j = 0; j < perm.members.size(); j++) {
+                if (detect(perm.members[j])) {
+                    return true;
+                }
+                const bool may_be_empty = (*rules_may_be_empty)[perm.members[j]];
+                any_member_may_be_empty = any_member_may_be_empty || may_be_empty;
+                if ((perm.required >> j & 1) && !may_be_empty) {
+                    required_members_may_be_empty = false;
+                }
+            }
+            bool sep_may_be_empty = true;
+            if (perm.sep != LLAMA_GRAMMAR_PERMUTE_NO_SEP) {
+                if (any_member_may_be_empty && detect(perm.sep)) {
+                    return true;
+                }
+                sep_may_be_empty = (*rules_may_be_empty)[perm.sep];
+            }
+            const bool one_required = (perm.required & (perm.required - 1)) == 0;
+            recurse_into_nonterminal = required_members_may_be_empty && (one_required || sep_may_be_empty);
         } else if (llama_grammar_is_end_of_sequence(&rule[i])) {
             recurse_into_nonterminal = true;
         } else {
@@ -1035,7 +1225,7 @@ static void llama_grammar_accept_chr(
         if (!llama_grammar_is_end_of_sequence(match.second)) {
             new_stack.push_back(match.second);
         }
-        llama_grammar_advance_stack(grammar.rules, new_stack, new_stacks);
+        llama_grammar_advance_stack(grammar.rules, grammar.permutes.get(), new_stack, new_stacks);
     }
 }
 
@@ -1054,6 +1244,7 @@ void llama_grammar_accept(struct llama_grammar * grammar, uint32_t chr) {
 // returns true when some match: they go to next, and the stacks that follow to next_stacks
 static bool llama_grammar_reject_step(
         const llama_grammar_rules      & rules,
+        llama_grammar_permute_states   * permutes,
         const llama_grammar_stack      & stack,
         const llama_grammar_candidates & candidates,
         size_t                           depth,
@@ -1117,7 +1308,7 @@ static bool llama_grammar_reject_step(
     if (!llama_grammar_is_end_of_sequence(stack_pos_after)) {
         stack_after.push_back(stack_pos_after);
     }
-    llama_grammar_advance_stack(rules, stack_after, next_stacks);
+    llama_grammar_advance_stack(rules, permutes, stack_after, next_stacks);
 
     return true;
 }
@@ -1126,6 +1317,7 @@ static bool llama_grammar_reject_step(
 // no recursion: a level per code point, a token from the GGUF can be long
 static llama_grammar_candidates llama_grammar_reject_candidates(
         const llama_grammar_rules      & rules,
+        llama_grammar_permute_states   * permutes,
         const llama_grammar_stacks     & stacks,
         const llama_grammar_candidates & candidates) {
     GGML_ASSERT(!stacks.empty()); // REVIEW
@@ -1165,7 +1357,7 @@ static llama_grammar_candidates llama_grammar_reject_candidates(
         std::vector<uint32_t> next;
         llama_grammar_stacks  next_stacks;
 
-        if (!llama_grammar_reject_step(rules, lv.stacks[lv.i], candidates, levels.size() - 1, lv.cur, rejects, next, next_stacks)) {
+        if (!llama_grammar_reject_step(rules, permutes, lv.stacks[lv.i], candidates, levels.size() - 1, lv.cur, rejects, next, next_stacks)) {
             lv.cur = std::move(rejects);
             lv.i++;
             continue;
@@ -1187,8 +1379,9 @@ static llama_grammar_candidates llama_grammar_reject_candidates(
 llama_grammar_candidates llama_grammar_reject_candidates_for_stack(
         const llama_grammar_rules      & rules,
         const llama_grammar_stack      & stack,
-        const llama_grammar_candidates & candidates) {
-    return llama_grammar_reject_candidates(rules, llama_grammar_stacks{ stack }, candidates);
+        const llama_grammar_candidates & candidates,
+        llama_grammar_permute_states   * permutes) {
+    return llama_grammar_reject_candidates(rules, permutes, llama_grammar_stacks{ stack }, candidates);
 }
 
 ////////////////////
@@ -1218,6 +1411,10 @@ struct llama_grammar * llama_grammar_init_impl(
                     return nullptr;
                 }
             }
+            if (elem.type == LLAMA_GRETYPE_PERMUTE) {
+                LLAMA_LOG_ERROR("invalid grammar: rule %zu has a permutation, which needs the grammar text\n", i);
+                return nullptr;
+            }
         }
     }
 
@@ -1230,7 +1427,7 @@ struct llama_grammar * llama_grammar_init_impl(
             if (rules_visited[i]) {
                 continue;
             }
-            if (llama_grammar_detect_left_recursion(vec_rules, i, &rules_visited, &rules_in_progress, &rules_may_be_empty)) {
+            if (llama_grammar_detect_left_recursion(vec_rules, {}, i, &rules_visited, &rules_in_progress, &rules_may_be_empty)) {
                 LLAMA_LOG_ERROR("unsupported grammar, left recursion detected for nonterminal at index %zu", i);
                 return nullptr;
             }
@@ -1249,7 +1446,7 @@ struct llama_grammar * llama_grammar_init_impl(
             // if alternate is nonempty, add to stack
             stack.push_back(pos);
         }
-        llama_grammar_advance_stack(vec_rules, stack, stacks);
+        llama_grammar_advance_stack(vec_rules, nullptr, stack, stacks);
         while (!llama_grammar_is_end_of_sequence(pos)) {
             // scan to end of alternate def
             pos++;
@@ -1276,6 +1473,7 @@ struct llama_grammar * llama_grammar_init_impl(
         /* .trigger_buffer_positions = */ {},
         /* .trigger_tokens = */           {},
         /* .trigger_patterns = */         {},
+        /* .permutes = */                 nullptr,
     };
 }
 
@@ -1328,7 +1526,7 @@ struct llama_grammar * llama_grammar_init_impl(
             if (rules_visited[i]) {
                 continue;
             }
-            if (llama_grammar_detect_left_recursion(vec_rules, i, &rules_visited, &rules_in_progress, &rules_may_be_empty)) {
+            if (llama_grammar_detect_left_recursion(vec_rules, parser.permutes, i, &rules_visited, &rules_in_progress, &rules_may_be_empty)) {
                 LLAMA_LOG_ERROR("unsupported grammar, left recursion detected for nonterminal at index %zu\n", i);
                 return nullptr;
             }
@@ -1337,6 +1535,8 @@ struct llama_grammar * llama_grammar_init_impl(
         LLAMA_LOG_ERROR("unsupported grammar: %s\n", err.what());
         return nullptr;
     }
+
+    auto permutes = std::make_shared<llama_grammar_permute_states>(std::move(parser.permutes));
 
     // loop over alternates of start rule to build initial stacks
     llama_grammar_stacks stacks;
@@ -1347,7 +1547,7 @@ struct llama_grammar * llama_grammar_init_impl(
             // if alternate is nonempty, add to stack
             stack.push_back(pos);
         }
-        llama_grammar_advance_stack(vec_rules, stack, stacks);
+        llama_grammar_advance_stack(vec_rules, permutes.get(), stack, stacks);
         while (!llama_grammar_is_end_of_sequence(pos)) {
             // scan to end of alternate def
             pos++;
@@ -1387,6 +1587,7 @@ struct llama_grammar * llama_grammar_init_impl(
         /* .trigger_buffer_positions = */ {},
         std::move(vec_trigger_tokens),
         std::move(vec_trigger_patterns),
+        std::move(permutes),
     };
 }
 
@@ -1410,9 +1611,10 @@ struct llama_grammar * llama_grammar_clone_impl(const struct llama_grammar & gra
         grammar.trigger_buffer_positions,
         grammar.trigger_tokens,
         grammar.trigger_patterns,
+        grammar.permutes,
     };
 
-    // redirect elements in stacks to point to new rules
+    // redirect elements in stacks to point to new rules, the expanded permutation states are shared
     for (size_t is = 0; is < result->stacks.size(); is++) {
         for (size_t ie = 0; ie < result->stacks[is].size(); ie++) {
             for (size_t ir0 = 0; ir0 < grammar.rules.size(); ir0++) {
@@ -1465,7 +1667,7 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
         }
     }
 
-    const auto rejects = llama_grammar_reject_candidates(grammar.rules, grammar.stacks, candidates_grammar);
+    const auto rejects = llama_grammar_reject_candidates(grammar.rules, grammar.permutes.get(), grammar.stacks, candidates_grammar);
     for (const auto & reject : rejects) {
         cur_p->data[reject.index].logit = -INFINITY;
     }
@@ -1566,7 +1768,7 @@ void llama_grammar_accept_token(struct llama_grammar & grammar, llama_token toke
                 if (!llama_grammar_is_end_of_sequence(pos + 1)) {
                     new_stack.push_back(pos + 1);
                 }
-                llama_grammar_advance_stack(grammar.rules, new_stack, stacks_new);
+                llama_grammar_advance_stack(grammar.rules, grammar.permutes.get(), new_stack, stacks_new);
             }
         } else {
             llama_grammar_stacks current_stacks = {stack};
