@@ -55,6 +55,27 @@ static __global__ void lightning_indexer_kernel_mma(
 
     const int start_kv = blockIdx.x * K_VECS_PER_BLOCK;
 
+    // keys masked out for this token (e.g. causal): the score is -inf whatever the dot products, skip them
+    {
+        const half * m_row = (const half *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3);
+        bool masked = true;
+        for (int i = tid; i < K_VECS_PER_BLOCK; i += THREADS_PER_BLOCK) {
+            const int i_kv = start_kv + i;
+            if (i_kv < n_kv && !(__half2float(m_row[i_kv]) == -INFINITY)) {
+                masked = false;
+            }
+        }
+        if (__syncthreads_and(masked)) {
+            float * dst_row = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
+            for (int i = tid; i < K_VECS_PER_BLOCK; i += THREADS_PER_BLOCK) {
+                if (start_kv + i < n_kv) {
+                    dst_row[start_kv + i] = -INFINITY;
+                }
+            }
+            return;
+        }
+    }
+
     const char  * q_base = (const char  *)                 Q + i_batch*nbq2 + i_stream*nbq3;
     const float * w_base = (const float *) ((const char *) W + i_batch*nbw1 + i_stream*nbw3);
 

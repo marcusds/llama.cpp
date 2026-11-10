@@ -9601,9 +9601,10 @@ struct test_lightning_indexer : public test_case {
     const int64_t nm; // ne[3] of mask
 
     const ggml_type type_K;
+    const bool causal; // token b sees the first kv*(b+1)/nb keys, as compressed causal keys
 
     std::string vars() override {
-        return VARS_TO_STR7(hsk, nh, kv, nb, ns, nm, type_K);
+        return VARS_TO_STR8(hsk, nh, kv, nb, ns, nm, type_K, causal);
     }
 
     double max_nmse_err() override {
@@ -9615,8 +9616,9 @@ struct test_lightning_indexer : public test_case {
         return ((2 * hsk + 2) * nh + 1) * kv * nb * ns;
     }
 
-    test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1, ggml_type type_K = GGML_TYPE_F16)
-        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K) {}
+    test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1, ggml_type type_K = GGML_TYPE_F16,
+            bool causal = false)
+        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K), causal(causal) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, ns);
@@ -9643,7 +9645,17 @@ struct test_lightning_indexer : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (strcmp(t->name, "m") == 0) {
+            if (strcmp(t->name, "m") == 0 && causal) {
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                    const int64_t b = r % t->ne[1];
+                    const int64_t n_vis = std::max<int64_t>(1, t->ne[0] * (b + 1) / t->ne[1]);
+                    for (int64_t i = 0; i < t->ne[0]; ++i) {
+                        data[r*t->ne[0] + i] = ggml_fp32_to_fp16(i < n_vis ? 0.0f : -INFINITY);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "m") == 0) {
                 init_tensor_kq_mask(t);
             } else {
                 init_tensor_uniform(t);
@@ -13242,6 +13254,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int kv : { 1, 7, 8, 63, 64, 65 }) {
         for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
+            test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 77, 1, 1, type_K, true));
         }
     }
 
@@ -13824,6 +13837,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             }
         }
     }
+
+    // DeepSeek-V4 prefill shape: 8192 tokens, 2048 compressed keys, causal
+    test_cases.emplace_back(new test_lightning_indexer(128, 64, 2048, 8192, 1, 1, GGML_TYPE_F16, true));
+    test_cases.emplace_back(new test_lightning_indexer(128, 64, 2048, 8192, 1, 1, GGML_TYPE_F16, false));
 
     // top_k_mask, Flash-Next QSA shapes: 512 pools of 4 + a 3-cell tail, and DSA shapes: 2048 cells
     for (int64_t n_kv : { 18432, 131072 }) {
