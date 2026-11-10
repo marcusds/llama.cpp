@@ -63,14 +63,20 @@ static __global__ void rope_norm(const T *            x,
                                  const float *        freq_factors,
                                  const int64_t *      row_indices,
                                  const int            set_rows_stride,
-                                 const bool           inplace) {
-    const int i0 = 2*(blockDim.y*blockIdx.y + threadIdx.y);
+                                 const bool           inplace,
+                                 const int            i0_offs,
+                                 const int            nr) {
+    // i0_offs > 0: in place, only the rotated range is launched
+    const int i0 = i0_offs + 2*(blockDim.y*blockIdx.y + threadIdx.y);
 
     if (i0 >= ne00) {
         return;
     }
 
     const int row_dst = blockDim.x*blockIdx.x + threadIdx.x;
+    if (row_dst >= nr) {
+        return;
+    }
 
     const uint32_t i3 = row_dst / (ne01 * ne02);
     const uint32_t i2 = (row_dst - i3 * ne01 * ne02) / ne01;
@@ -391,20 +397,24 @@ static void rope_norm_cuda(const T *            x,
                            const bool           inplace,
                            cudaStream_t         stream) {
     GGML_ASSERT(ne00 % 2 == 0);
-    const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
-    const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
-    const dim3 block_nums(nr, n_blocks_x, 1);
+    // in place with few rotated dims: launch only those, several rows per block
+    const bool part = inplace && set_rows_stride == 0 && n_dims < ne00 && n_dims <= 64;
+    const int  rows_per_block = part ? CUDA_ROPE_BLOCK_SIZE/32 : 1;
+    const dim3 block_dims(rows_per_block, part ? 32 : CUDA_ROPE_BLOCK_SIZE, 1);
+    const int  n_blocks_x = part ? 1 : (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
+    const dim3 block_nums((nr + rows_per_block - 1) / rows_per_block, n_blocks_x, 1);
+    const int  i0_offs = part ? n_offs : 0;
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
 
     if (freq_factors == nullptr) {
         rope_norm<forward, false><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, n_offs, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride, inplace);
+            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride, inplace, i0_offs, nr);
     } else {
         rope_norm<forward, true><<<block_nums, block_dims, 0, stream>>>(
             x, dst, ne00, ne01, ne02, s01, s02, s03, s1, s2, s3, n_dims, n_offs, pos, freq_scale, ext_factor,
-            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride, inplace);
+            attn_factor, corr_dims, theta_scale, freq_factors, row_indices, set_rows_stride, inplace, i0_offs, nr);
     }
 }
 
