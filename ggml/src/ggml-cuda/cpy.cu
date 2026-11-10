@@ -176,6 +176,57 @@ static __global__ void cpy_q_f32(const char * cx, char * cdst, const int64_t ne,
     cpy_blck(cx + x_offset, cdst + dst_offset);
 }
 
+// same-type copy where each row (dim 0) is contiguous: 16 B per thread, no 64-bit index math
+static __global__ void cpy_rows_16b(const char * __restrict__ cx, char * __restrict__ cdst, const uint32_t n,
+        const uint3 nr_fd, const uint3 ne1_fd, const uint3 ne2_fd,
+        const int64_t nb01, const int64_t nb02, const int64_t nb03, const int64_t nb11, const int64_t nb12, const int64_t nb13) {
+    const uint32_t i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const uint2 rc = fast_div_modulo(i, nr_fd);    // row, int4 in row
+    const uint2 r1 = fast_div_modulo(rc.x, ne1_fd); // i2*ne2.., i1
+    const uint2 r2 = fast_div_modulo(r1.x, ne2_fd); // i3, i2
+    const int64_t c = (int64_t) rc.y*16;
+
+    ggml_cuda_pdl_sync();
+    const int4 v = *(const int4 *) (cx + r1.y*nb01 + r2.y*nb02 + r2.x*nb03 + c);
+    *(int4 *) (cdst + r1.y*nb11 + r2.y*nb12 + r2.x*nb13 + c) = v;
+}
+
+static bool ggml_cpy_rows_16b_cuda(const ggml_tensor * src0, ggml_tensor * src1, cudaStream_t stream) {
+    // a contiguous dst may have another shape: it is then written in the element order of src0
+    const bool dst_flat = !ggml_are_same_shape(src0, src1);
+    if (src0->type != src1->type || (dst_flat && !ggml_is_contiguous(src1)) || ggml_is_quantized(src0->type)) {
+        return false;
+    }
+    const size_t ts = ggml_type_size(src0->type);
+    size_t dnb[GGML_MAX_DIMS];
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        dnb[d] = !dst_flat ? src1->nb[d] : d == 0 ? ts : dnb[d - 1]*src0->ne[d - 1];
+    }
+    const size_t row = src0->ne[0]*ts;
+    if (src0->nb[0] != ts || dnb[0] != ts || row % 16 != 0 || ((uintptr_t) src0->data | (uintptr_t) src1->data) % 16 != 0) {
+        return false;
+    }
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        if ((src0->nb[d] | dnb[d]) % 16 != 0) {
+            return false;
+        }
+    }
+    const int64_t nr = row/16;
+    const int64_t n  = nr*ggml_nrows(src0);
+    if (n >= INT_MAX) {
+        return false;
+    }
+    const int nth = 256;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3) ((n + nth - 1)/nth), nth, 0, stream);
+    ggml_cuda_kernel_launch(cpy_rows_16b, launch_params, (const char *) src0->data, (char *) src1->data, (uint32_t) n,
+        init_fastdiv_values(nr), init_fastdiv_values(src0->ne[1]), init_fastdiv_values(src0->ne[2]),
+        (int64_t) src0->nb[1], (int64_t) src0->nb[2], (int64_t) src0->nb[3], (int64_t) dnb[1], (int64_t) dnb[2], (int64_t) dnb[3]);
+    return true;
+}
+
 template<typename src_t, typename dst_t>
 static __global__ void cpy_scalar_contiguous(const char * cx, char * cdst, const int64_t ne) {
     const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
@@ -477,6 +528,8 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
         CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
                                      mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
+    } else if (ggml_cpy_rows_16b_cuda(src0, src1, main_stream)) {
+        // rows of 16 B multiples, e.g. permuted batched matmul outputs
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         if (can_be_transposed) {
             ggml_cpy_scalar_cuda<float, float, true>
