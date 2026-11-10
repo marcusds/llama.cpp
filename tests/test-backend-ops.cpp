@@ -12391,6 +12391,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         // inplace with an offset
         test_cases.emplace_back(new test_rope(type, {128, 32, 2, 1}, 32, GGML_ROPE_TYPE_NEOX, 512, 1.4245f, 0.7465f, 1.4245f, false, 0, true, true, 32));
+        // inplace with an offset, normal mode (DeepSeek-V4 q and the attention output): only the rotated dims are launched
+        for (bool fw : {true, false}) {
+            test_cases.emplace_back(new test_rope(type, {512, 13, 3, 1}, 64, GGML_ROPE_TYPE_NORMAL, 512, 1.4245f, 0.7465f, 1.4245f, false, 0, fw, true, 448));
+            test_cases.emplace_back(new test_rope(type, {128, 7, 5, 1}, 32, GGML_ROPE_TYPE_NORMAL, 512, 1.4245f, 0.7465f, 1.4245f, true, 0, fw, true, 32));
+        }
     }
 
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
