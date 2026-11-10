@@ -5804,6 +5804,36 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// MoE down projection: MUL_MAT_ID, per-expert scale (RESHAPE/REPEAT/GET_ROWS/MUL), router weights, sum over the used experts
+struct test_mul_mat_id_down_reduce : public test_mul_mat_id {
+    using test_mul_mat_id::test_mul_mat_id;
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_REDUCE";
+    }
+    bool run_whole_graph() override { return true; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat_id::build_graph(ctx);
+        ggml_tensor * ids = out->src[2];
+        ggml_tensor * w_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_mats);
+        ggml_set_name(w_s, "w_s");
+        ggml_tensor * s = ggml_reshape_3d(ctx, w_s, 1, n_mats, 1);
+        s = ggml_repeat_4d(ctx, s, 1, n_mats, n, 1);
+        s = ggml_get_rows(ctx, s, ids);
+        out = ggml_mul(ctx, out, s);
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
+        ggml_set_name(weights, "weights");
+        out = ggml_mul(ctx, out, weights);
+        ggml_tensor * sum = nullptr;
+        for (int u = 0; u < n_used; ++u) {
+            ggml_tensor * v = ggml_view_2d(ctx, out, m, n, out->nb[2], u * out->nb[1]);
+            sum = sum ? ggml_add(ctx, sum, v) : v;
+        }
+        ggml_set_name(sum, "moe_out");
+        return sum;
+    }
+};
+
 // MUL_MAT_ID with expert ids repeated within a token's row
 struct test_mul_mat_id_dup : public test_mul_mat_id {
     using test_mul_mat_id::test_mul_mat_id;
@@ -11654,6 +11684,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 384, 6, false, 2304, 3748, 5120));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 384, 6, true,  2304, 600, 5120));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 6, false, 1024, 300, 2304));
+    // down projection with scale, router weights and the expert sum (fused on the cuBLASLt path)
+    for (int n : {8, 33, 300}) {
+        test_cases.emplace_back(new test_mul_mat_id_down_reduce(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 6, false, 1024, n, 512));
+    }
+    test_cases.emplace_back(new test_mul_mat_id_down_reduce(GGML_TYPE_NVFP4, GGML_TYPE_F32, 64, 6, false, 256, 40, 256, 0, false, true));
     // small batches just above the MMVQ limit
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 64, 6, false, 256, 17, 512));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 256, 6, false, 512, 40, 1024));
