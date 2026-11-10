@@ -32,6 +32,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/mmid-nvfp4-lt.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -749,6 +750,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    ggml_cuda_mul_mat_id_nvfp4_lt_free(*this);
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -2255,6 +2257,10 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
     if (use_mmvq || !ggml_cuda_should_use_mmq(x_up->type, cc, ncols, /*n_experts =*/ is_id ? x_up->ne[2] : 0)) {
         return false;
     }
+    // the cuBLASLt NVFP4 MUL_MAT_ID path is faster than the fused MMQ kernel where it applies
+    if (is_id && ggml_cuda_mul_mat_id_nvfp4_lt_applicable(up, cc)) {
+        return false;
+    }
 
     // The fused kernel needs one block per tile (no stream-k split), so only fuse if the tiling is efficient.
     return ggml_cuda_mmq_fusion_is_efficient(x_up->type, ggml_prec_get_src(up, 1), x_up->ne[1], ncols, nchannels, device);
@@ -2327,6 +2333,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return true;
     }
 
+    if (ggml_cuda_mul_mat_id_nvfp4_lt_applicable(dst, cc)) {
+        return true;
+    }
+
     if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
         if (ggml_is_quantized(src0->type)) {
             if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
@@ -2360,6 +2370,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+
+    if (ggml_cuda_mul_mat_id_nvfp4_lt_applicable(dst, cc) && ggml_cuda_mul_mat_id_nvfp4_lt(ctx, dst)) {
+        return;
+    }
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -4099,6 +4113,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // NVFP4 down projection on cuBLASLt: the per-expert scale, the router weights and the sum over the used
+    // experts are applied while reading the GEMM output (MUL_MAT_ID, scale RESHAPE/REPEAT/GET_ROWS/MUL, weighted reduction)
+    if (node->op == GGML_OP_MUL_MAT_ID && i + 5 < cgraph->n_nodes &&
+            ggml_cuda_mul_mat_id_nvfp4_lt_applicable(node, ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        const ggml_tensor * scale = ggml_cuda_get_mul_mat_id_scale(cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3],
+            cgraph->nodes[i + 4], node);
+        ggml_cuda_moe_weighted_reduction_match match;
+        if (scale && cgraph->nodes[i + 1]->op == GGML_OP_RESHAPE && cgraph->nodes[i + 2]->op == GGML_OP_REPEAT &&
+                cgraph->nodes[i + 3]->op == GGML_OP_GET_ROWS && cgraph->nodes[i + 4]->op == GGML_OP_MUL &&
+                ggml_cuda_match_moe_weighted_reduction(cgraph, i + 4, match) &&
+                match.experts == node && match.expert_scale == cgraph->nodes[i + 3] && match.dst->ne[0] == node->ne[0]) {
+            const int n_ops = 4 + match.node_count;
+            std::vector<ggml_op> ops(n_ops);
+            for (int j = 0; j < n_ops; ++j) {
+                ops[j] = cgraph->nodes[i + j]->op;
+            }
+            const int out_idx = i + n_ops - 1;
+            if (ggml_can_fuse_subgraph(cgraph, i, n_ops, ops.data(), &out_idx, 1) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, &out_idx, 1)) {
+                ggml_cuda_nvfp4_lt_epilogue epi;
+                epi.expert_scale = (const float *) scale->data;
+                epi.weights      = (const float *) match.weights->data;
+                epi.out          = match.dst->data;
+                if (ggml_cuda_mul_mat_id_nvfp4_lt(*cuda_ctx, node, &epi)) {
+                    return n_ops - 1;
+                }
+            }
+        }
+    }
+
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
@@ -4510,6 +4554,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     continue;
                 }
 
+                // cuBLASLt NVFP4 path: per-expert scale in the gate output, scale and GLU in the up output
+                if (!with_bias && ggml_get_op_params_i32(glu, 1) == 0 &&
+                        ggml_cuda_mul_mat_id_nvfp4_lt_applicable(up_n, ggml_cuda_info().devices[cuda_ctx->device].cc) && ggml_cuda_mul_mat_id_nvfp4_lt_applicable(gate_n, ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+                        ggml_are_same_stride(gate_scale_n, gate_n) && ggml_are_same_stride(glu, up_n) && ggml_are_same_shape(glu, up_n) &&
+                        ggml_are_same_shape(gate_n, up_n) && ggml_are_same_stride(gate_n, up_n)) {
+                    ggml_cuda_nvfp4_lt_epilogue epi_gate;
+                    epi_gate.expert_scale = (const float *) gate_scale->data;
+                    epi_gate.out          = gate_scale_n->data;
+                    ggml_cuda_nvfp4_lt_epilogue epi_up;
+                    epi_up.expert_scale = (const float *) up_scale->data;
+                    epi_up.gate         = (const float *) gate_scale_n->data;
+                    epi_up.glu_op       = ggml_get_glu_op(glu);
+                    epi_up.glu_limit    = ggml_get_op_params_f32(glu, 3);
+                    epi_up.out          = cgraph->nodes[glu_idx]->data;
+                    if (ggml_cuda_mul_mat_id_nvfp4_lt(*cuda_ctx, gate_n, &epi_gate)) {
+                        GGML_ASSERT(ggml_cuda_mul_mat_id_nvfp4_lt(*cuda_ctx, up_n, &epi_up));
+                        fused_mul_mat_vec = true;
+                        fused_node_count  = n_ops;
+                        break;
+                    }
+                }
+
                 const ggml_tensor * up_bias   = with_bias ? get_bias_tensor(up_out_n, up_scale_n, bias_op) : nullptr;
                 const ggml_tensor * gate_bias = with_bias ? get_bias_tensor(gate_out_n, gate_scale_n, bias_op) : nullptr;
 
@@ -4749,6 +4815,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fused_mul_mat_vec = true;
                 fused_node_count  = n_ops;
                 break;
+            }
+
+            // the cuBLASLt NVFP4 MUL_MAT_ID applies the per-expert scale in its output
+            if (op == GGML_OP_MUL_MAT_ID && !with_bias && ggml_is_contiguous(mm_node) && ggml_is_contiguous(out_node) &&
+                    ggml_cuda_mul_mat_id_nvfp4_lt_applicable(mm_node, ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+                ggml_cuda_nvfp4_lt_epilogue epi;
+                epi.expert_scale = (const float *) scale->data;
+                epi.out          = out_node->data;
+                if (ggml_cuda_mul_mat_id_nvfp4_lt(*cuda_ctx, mm_node, &epi)) {
+                    fused_mul_mat_vec = true;
+                    fused_node_count  = n_ops;
+                    break;
+                }
             }
         }
         if (fused_mul_mat_vec) {
@@ -5131,6 +5210,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_mul_mat_id_nvfp4_lt_graph_begin(*cuda_ctx, cgraph);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

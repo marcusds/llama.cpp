@@ -5747,7 +5747,7 @@ struct test_mul_mat_id : public test_case {
         // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) &&
                 !graph_mul_mat_hi_prec_act(gf, GGML_OP_MUL_MAT_ID) &&
-                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+                (backend_has_feature(backend, "BLACKWELL_NATIVE_FP4") || (type_a == GGML_TYPE_NVFP4 && getenv("GGML_CUDA_NVFP4_CUBLASLT")))) {
             return 2e-2;
         }
         if (type_a == GGML_TYPE_F8_E4M3 && backend_has_feature(backend, "NATIVE_FP8")) {
@@ -5801,6 +5801,36 @@ struct test_mul_mat_id : public test_case {
 
     void reinit_perf_iter(ggml_context * ctx) override {
         init_mul_mat_id_ids(ctx, n_mats, skip);
+    }
+};
+
+// MoE down projection: MUL_MAT_ID, per-expert scale (RESHAPE/REPEAT/GET_ROWS/MUL), router weights, sum over the used experts
+struct test_mul_mat_id_down_reduce : public test_mul_mat_id {
+    using test_mul_mat_id::test_mul_mat_id;
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_REDUCE";
+    }
+    bool run_whole_graph() override { return true; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat_id::build_graph(ctx);
+        ggml_tensor * ids = out->src[2];
+        ggml_tensor * w_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_mats);
+        ggml_set_name(w_s, "w_s");
+        ggml_tensor * s = ggml_reshape_3d(ctx, w_s, 1, n_mats, 1);
+        s = ggml_repeat_4d(ctx, s, 1, n_mats, n, 1);
+        s = ggml_get_rows(ctx, s, ids);
+        out = ggml_mul(ctx, out, s);
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
+        ggml_set_name(weights, "weights");
+        out = ggml_mul(ctx, out, weights);
+        ggml_tensor * sum = nullptr;
+        for (int u = 0; u < n_used; ++u) {
+            ggml_tensor * v = ggml_view_2d(ctx, out, m, n, out->nb[2], u * out->nb[1]);
+            sum = sum ? ggml_add(ctx, sum, v) : v;
+        }
+        ggml_set_name(sum, "moe_out");
+        return sum;
     }
 };
 
@@ -8217,6 +8247,10 @@ struct test_mul_mat_vec_fusion : public test_case {
 
     double max_nmse_err(ggml_backend_t backend) override {
         // 4-bit activations on Blackwell, see test_mul_mat
+        // the cuBLASLt NVFP4 MUL_MAT_ID path (opt-in) also quantizes the activations, the GLU multiplies two such results
+        if (type == GGML_TYPE_NVFP4 && use_id && m > 16 && getenv("GGML_CUDA_NVFP4_CUBLASLT")) {
+            return 5e-2;
+        }
         if (type == GGML_TYPE_NVFP4 && !graph_mul_mat_hi_prec_act(gf, use_id ? GGML_OP_MUL_MAT_ID : GGML_OP_MUL_MAT) &&
                 backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
@@ -11644,6 +11678,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 4, 2, true,  64, 16, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_NVFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_NVFP4, GGML_TYPE_F32, 4, 2, true,  64, 16, 256));
+    // large batch, uneven and empty experts (cuBLASLt grouped path)
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 16, 2, false, 256, 300, 512));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 64, 4, true,  256, 300, 512));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 384, 6, false, 2304, 3748, 5120));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 384, 6, true,  2304, 600, 5120));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 6, false, 1024, 300, 2304));
+    // down projection with scale, router weights and the expert sum (fused on the cuBLASLt path)
+    for (int n : {8, 33, 300}) {
+        test_cases.emplace_back(new test_mul_mat_id_down_reduce(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 6, false, 1024, n, 512));
+    }
+    test_cases.emplace_back(new test_mul_mat_id_down_reduce(GGML_TYPE_NVFP4, GGML_TYPE_F32, 64, 6, false, 256, 40, 256, 0, false, true));
+    // small batches just above the MMVQ limit
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 64, 6, false, 256, 17, 512));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 256, 6, false, 512, 40, 1024));
     test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 64, 16, 512));
     test_cases.emplace_back(new test_mul_mat_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 32, 256));
@@ -12966,6 +13014,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
+    }
+
+    // NVFP4 gate and up above 16 tokens (cuBLASLt path on cc 10.x), with and without a per-expert scale in between
+    for (bool with_lane_scale : {false, true}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_NVFP4, GGML_GLU_OP_SWIGLU_CLAMP, 64, 256, 256,
+            true, 16, 8, false, false, true, with_lane_scale, {1, 1}));
+    }
+    // up alone with its per-expert scale (the gate in another graph split, as with CPU experts)
+    for (bool b : {false, true}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_NVFP4, GGML_GLU_OP_SWIGLU, 64, 256, 256,
+            true, 16, 8, b, false, false, true, {1, 1}));
     }
 
     // Gate and up on the SYCL XMX kernels: rows long enough for 2D block loads, a last tile of 8 rows, and
