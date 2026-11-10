@@ -2257,6 +2257,10 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
     if (use_mmvq || !ggml_cuda_should_use_mmq(x_up->type, cc, ncols, /*n_experts =*/ is_id ? x_up->ne[2] : 0)) {
         return false;
     }
+    // the cuBLASLt NVFP4 MUL_MAT_ID path is faster than the fused MMQ kernel where it applies
+    if (is_id && ggml_cuda_mul_mat_id_nvfp4_lt_applicable(up, cc)) {
+        return false;
+    }
 
     // The fused kernel needs one block per tile (no stream-k split), so only fuse if the tiling is efficient.
     return ggml_cuda_mmq_fusion_is_efficient(x_up->type, ggml_prec_get_src(up, 1), x_up->ne[1], ncols, nchannels, device);
