@@ -446,7 +446,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
     cb(qr, "qr_norm", il);
 
     ggml_tensor * q = ggml_reshape_3d(ctx0, build_lora_mm(layer.wq_b, qr), n_embd_head, n_head, nt);
-    q = rope(q, inp_pos, n_embd_head_nope);
+    // in place: only the n_embd_head_rope rotated values are read and written
+    q = ggml_rope_set_offset(ggml_rope_ext_inplace(ctx0, q, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
+            freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l), n_embd_head_nope);
     cb(q, "q", il);
 
     ggml_tensor * kv = build_norm(build_lora_mm(layer.wkv, cur), layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
@@ -749,8 +751,10 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
     }
 
     out = ggml_reshape_3d(ctx0, out, n_embd_head, n_head, nt);
-    out = ggml_rope_ext_back(ctx0, out, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
+    // inverse rotation in place (ggml_rope_ext_back without the copy of the unrotated values)
+    out = ggml_rope_ext_inplace(ctx0, out, inp_pos, nullptr, n_embd_head_rope, rope_type, n_ctx_orig_l,
             freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
+    out->op = GGML_OP_ROPE_BACK;
     out = ggml_rope_set_offset(out, n_embd_head_nope);
     cb(out, "attn_derope", il);
 
