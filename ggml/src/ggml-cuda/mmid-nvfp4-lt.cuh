@@ -16,6 +16,6 @@ struct ggml_cuda_nvfp4_lt_epilogue {
 // returns false when the op cannot be done here (the caller then uses the default path)
 bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_nvfp4_lt_epilogue * epi = nullptr);
 
-// the cached activations of the previous call must not be reused in a new graph
-void ggml_cuda_mul_mat_id_nvfp4_lt_invalidate(ggml_backend_cuda_context & ctx);
+// call at the start of each graph compute: drops the cached activations unless the graph continues the previous one
+void ggml_cuda_mul_mat_id_nvfp4_lt_graph_begin(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph);
 void ggml_cuda_mul_mat_id_nvfp4_lt_free(ggml_backend_cuda_context & ctx);

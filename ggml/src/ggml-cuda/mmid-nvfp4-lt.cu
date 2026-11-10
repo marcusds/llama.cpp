@@ -264,6 +264,8 @@ bool ggml_cuda_mul_mat_id_nvfp4_lt_applicable(const ggml_tensor * dst, const int
 
 // The quantized activations and the routing of one call, kept for the next call with the same
 // src1 and ids (the gate and up projections of a MoE layer); used once, then invalidated.
+// The entry survives into the next graph compute only when that graph continues the node array
+// of the previous one (the next split of the same scheduler graph, e.g. with CPU experts).
 struct nvfp4_lt_act_key {
     const void * src1, * src1_data, * ids, * ids_data;
     int64_t v[13];
@@ -275,6 +277,7 @@ struct nvfp4_lt_act_key {
 struct nvfp4_lt_act_cache {
     bool valid = false;
     nvfp4_lt_act_key key = {};
+    ggml_tensor * const * nodes_end = nullptr; // end of the node array of the previous graph
     int device = -1;
     // device buffers: counts (3 E int32), sc_off (E int64), pairs, x_q, x_s, row_scale
     void * buf[6] = {};
@@ -292,10 +295,15 @@ static void * nvfp4_lt_cache_buf(nvfp4_lt_act_cache * c, const int i, const size
     return c->buf[i];
 }
 
-void ggml_cuda_mul_mat_id_nvfp4_lt_invalidate(ggml_backend_cuda_context & ctx) {
-    if (ctx.nvfp4_lt_cache != nullptr) {
-        ((nvfp4_lt_act_cache *) ctx.nvfp4_lt_cache)->valid = false;
+void ggml_cuda_mul_mat_id_nvfp4_lt_graph_begin(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph) {
+    nvfp4_lt_act_cache * c = (nvfp4_lt_act_cache *) ctx.nvfp4_lt_cache;
+    if (c == nullptr || cgraph->n_nodes == 0) {
+        return;
     }
+    if (cgraph->nodes != c->nodes_end) {
+        c->valid = false;
+    }
+    c->nodes_end = cgraph->nodes + cgraph->n_nodes;
 }
 
 void ggml_cuda_mul_mat_id_nvfp4_lt_free(ggml_backend_cuda_context & ctx) {
@@ -464,7 +472,7 @@ bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor 
 
 bool ggml_cuda_mul_mat_id_nvfp4_lt_applicable(const ggml_tensor *, int) { return false; }
 bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context &, ggml_tensor *, const ggml_cuda_nvfp4_lt_epilogue *) { return false; }
-void ggml_cuda_mul_mat_id_nvfp4_lt_invalidate(ggml_backend_cuda_context &) {}
+void ggml_cuda_mul_mat_id_nvfp4_lt_graph_begin(ggml_backend_cuda_context &, const ggml_cgraph *) {}
 void ggml_cuda_mul_mat_id_nvfp4_lt_free(ggml_backend_cuda_context &) {}
 
 #endif // cuBLASLt grouped FP4 available
