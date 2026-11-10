@@ -4816,6 +4816,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fused_node_count  = n_ops;
                 break;
             }
+
+            // the cuBLASLt NVFP4 MUL_MAT_ID applies the per-expert scale in its output
+            if (op == GGML_OP_MUL_MAT_ID && !with_bias && ggml_is_contiguous(mm_node) && ggml_is_contiguous(out_node) &&
+                    ggml_cuda_mul_mat_id_nvfp4_lt_applicable(mm_node, ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+                ggml_cuda_nvfp4_lt_epilogue epi;
+                epi.expert_scale = (const float *) scale->data;
+                epi.out          = out_node->data;
+                if (ggml_cuda_mul_mat_id_nvfp4_lt(*cuda_ctx, mm_node, &epi)) {
+                    fused_mul_mat_vec = true;
+                    fused_node_count  = n_ops;
+                    break;
+                }
+            }
         }
         if (fused_mul_mat_vec) {
             break;

@@ -13021,6 +13021,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_NVFP4, GGML_GLU_OP_SWIGLU_CLAMP, 64, 256, 256,
             true, 16, 8, false, false, true, with_lane_scale, {1, 1}));
     }
+    // up alone with its per-expert scale (the gate in another graph split, as with CPU experts)
+    for (bool b : {false, true}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_NVFP4, GGML_GLU_OP_SWIGLU, 64, 256, 256,
+            true, 16, 8, b, false, false, true, {1, 1}));
+    }
 
     // Gate and up on the SYCL XMX kernels: rows long enough for 2D block loads, a last tile of 8 rows, and
     // columns on both sides of the 8 and 16 column tiles
