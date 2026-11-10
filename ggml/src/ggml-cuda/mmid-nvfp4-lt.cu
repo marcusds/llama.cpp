@@ -141,6 +141,82 @@ static __global__ void k_nvfp4_lt_quantize_act(
     }
 }
 
+// one block per src1 row: quantizes the row once and writes it to every pair that uses it (inv maps
+// pair -> sorted row, -1 if unused); 4 lanes per 16 value sub-block, same math as k_nvfp4_lt_quantize_act
+#define NVFP4_LT_QROW_THREADS 256
+template <int items>
+static __global__ void __launch_bounds__(NVFP4_LT_QROW_THREADS) k_nvfp4_lt_quantize_rows(
+        const char * __restrict__ src, const int32_t * __restrict__ inv, const nvfp4_lt_pair * __restrict__ pairs,
+        uint8_t * __restrict__ dst_q, uint8_t * __restrict__ dst_s, float * __restrict__ row_scale, const int64_t K,
+        const int64_t n_used, const int64_t src_ne1, const int64_t src_nb1, const int64_t src_nb2) {
+    const int64_t t = blockIdx.x / src_ne1;
+    const int64_t j = blockIdx.x % src_ne1;
+    const float4 * x = (const float4 *) (src + t * src_nb2 + j * src_nb1);
+    const int n4 = (int) (K / 4);
+
+    float4 v[items];
+    float amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < items; ++i) {
+        const int idx = threadIdx.x + i * NVFP4_LT_QROW_THREADS;
+        v[i] = idx < n4 ? x[idx] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        amax = fmaxf(amax, fmaxf(fmaxf(fabsf(v[i].x), fabsf(v[i].y)), fmaxf(fabsf(v[i].z), fabsf(v[i].w))));
+    }
+    amax = warp_reduce_max<WARP_SIZE>(amax);
+    __shared__ float smax[NVFP4_LT_QROW_THREADS / WARP_SIZE];
+    if (threadIdx.x % WARP_SIZE == 0) {
+        smax[threadIdx.x / WARP_SIZE] = amax;
+    }
+    __syncthreads();
+    amax = 0.0f;
+#pragma unroll
+    for (int w = 0; w < NVFP4_LT_QROW_THREADS / WARP_SIZE; ++w) {
+        amax = fmaxf(amax, smax[w]);
+    }
+    const float g     = amax / (6.0f * 448.0f);
+    const float g_inv = g > 0.0f ? 1.0f / g : 0.0f;
+
+    // K % 64 == 0, so the 4 lanes of a sub-block are all in or all out of range
+    uint16_t q[items];
+    uint8_t  sc_b[items];
+#pragma unroll
+    for (int i = 0; i < items; ++i) {
+        const float a0 = v[i].x * g_inv, a1 = v[i].y * g_inv, a2 = v[i].z * g_inv, a3 = v[i].w * g_inv;
+        float a = fmaxf(fmaxf(fabsf(a0), fabsf(a1)), fmaxf(fabsf(a2), fabsf(a3)));
+        a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFF, a, 1));
+        a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFF, a, 2));
+        const __nv_fp8_e4m3 sc(a / 6.0f);
+        const float sc_f   = (float) sc;
+        const float sc_inv = sc_f > 0.0f ? 1.0f / sc_f : 0.0f;
+        q[i] = (uint16_t) (nvfp4_lt_e2m1(a0 * sc_inv) | (nvfp4_lt_e2m1(a1 * sc_inv) << 4) |
+                          (nvfp4_lt_e2m1(a2 * sc_inv) << 8) | (nvfp4_lt_e2m1(a3 * sc_inv) << 12));
+        sc_b[i] = sc.__x;
+    }
+
+    const int ncol_tiles = (int) (K / 64);
+    for (int64_t u = j; u < n_used; u += src_ne1) {
+        const int32_t d = inv[t * n_used + u];
+        if (d < 0) {
+            continue;
+        }
+        const nvfp4_lt_pair pr = pairs[d];
+        uint16_t * dq = (uint16_t *) (dst_q + (int64_t) d * (K / 2));
+#pragma unroll
+        for (int i = 0; i < items; ++i) {
+            const int idx = threadIdx.x + i * NVFP4_LT_QROW_THREADS;
+            if (idx < n4) {
+                dq[idx] = q[i];
+                if (idx % 4 == 0) {
+                    dst_s[pr.sc_base + nvfp4_lt_scale_off(pr.row, idx / 4, ncol_tiles)] = sc_b[i];
+                }
+            }
+        }
+        if (threadIdx.x == 0) {
+            row_scale[d] = g;
+        }
+    }
+}
+
 template <bool has_scale, bool has_glu>
 static __global__ void k_nvfp4_lt_scatter(
         const nv_bfloat16 * __restrict__ src, const nvfp4_lt_pair * __restrict__ pairs, const float * __restrict__ row_scale,
@@ -227,7 +303,7 @@ static __global__ void k_nvfp4_lt_setup(const int32_t * __restrict__ counts, int
 }
 
 static __global__ void k_nvfp4_lt_place(const char * __restrict__ ids, const int32_t * __restrict__ row_off, const int64_t * __restrict__ sc_off,
-        int32_t * __restrict__ cursor, nvfp4_lt_pair * __restrict__ pairs, const int64_t n_used, const size_t nb0, const size_t nb1,
+        int32_t * __restrict__ cursor, nvfp4_lt_pair * __restrict__ pairs, int32_t * __restrict__ inv, const int64_t n_used, const size_t nb0, const size_t nb1,
         const int64_t n_pairs, const int32_t E, const int64_t src_nb1, const int64_t src_nb2, const int64_t src_ne1, const int64_t dst_nb1, const int64_t dst_nb2) {
     const int64_t p = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (p >= n_pairs) {
@@ -246,6 +322,7 @@ static __global__ void k_nvfp4_lt_place(const char * __restrict__ ids, const int
     pr.row     = r;
     pr.expert  = e;
     pairs[row_off[e] + r] = pr;
+    inv[p] = row_off[e] + r;
 }
 
 bool ggml_cuda_mul_mat_id_nvfp4_lt_applicable(const ggml_tensor * dst, const int cc) {
@@ -375,6 +452,7 @@ bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor 
     ggml_cuda_pool_alloc<nvfp4_lt_pair> pairs_p(pool);
     ggml_cuda_pool_alloc<uint8_t> x_q_p(pool), x_s_p(pool);
     ggml_cuda_pool_alloc<float> row_scale_p(pool);
+    ggml_cuda_pool_alloc<int32_t> inv_p(pool); // pair -> sorted row, only for this call
     int32_t       * counts_d  = use_cache ? (int32_t *)       nvfp4_lt_cache_buf(c, 0, 3 * E * sizeof(int32_t))         : counts_p.alloc(3 * E);
     int64_t       * sc_off_d  = use_cache ? (int64_t *)       nvfp4_lt_cache_buf(c, 1, E * sizeof(int64_t))             : sc_off_p.alloc(E);
     nvfp4_lt_pair * pairs_d   = use_cache ? (nvfp4_lt_pair *) nvfp4_lt_cache_buf(c, 2, n_pairs * sizeof(nvfp4_lt_pair)) : pairs_p.alloc(n_pairs);
@@ -388,13 +466,14 @@ bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor 
     if (!hit) {
         CUDA_CHECK(cudaMemsetAsync(counts_d, 0, 2 * E * sizeof(int32_t), stream));
         CUDA_CHECK(cudaMemsetAsync(pairs_d, 0xFF, n_pairs * sizeof(nvfp4_lt_pair), stream));
+        CUDA_CHECK(cudaMemsetAsync(inv_p.alloc(n_pairs), 0xFF, n_pairs * sizeof(int32_t), stream));
         CUDA_CHECK(cudaMemsetAsync(x_s, 0, sc_bytes, stream));
         k_nvfp4_lt_count<<<nbp, 256, 0, stream>>>((const char *) ids->data, counts, n_used, ids->nb[0], ids->nb[1], n_pairs, Ei);
     }
     k_nvfp4_lt_setup<<<1, NVFP4_LT_SETUP_THREADS, 0, stream>>>(counts, row_off, sc_off_d, meta_d.ptr, Ei, N, K,
         w_q.ptr, w_s.ptr, x_q, x_s, y.ptr);
     if (!hit) {
-        k_nvfp4_lt_place<<<nbp, 256, 0, stream>>>((const char *) ids->data, row_off, sc_off_d, cursor, pairs_d, n_used, ids->nb[0], ids->nb[1],
+        k_nvfp4_lt_place<<<nbp, 256, 0, stream>>>((const char *) ids->data, row_off, sc_off_d, cursor, pairs_d, inv_p.ptr, n_used, ids->nb[0], ids->nb[1],
             n_pairs, Ei, src1->nb[1], src1->nb[2], src1->ne[1], dst->nb[1], dst->nb[2]);
     }
     CUDA_CHECK(cudaGetLastError());
@@ -406,7 +485,25 @@ bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor 
         CUDA_CHECK(cudaGetLastError());
     }
     if (!hit) {
-        k_nvfp4_lt_quantize_act<<<n_pairs, 128, 0, stream>>>((const char *) src1->data, pairs_d, x_q, x_s, row_scale, K);
+        const bool aligned = ((uintptr_t) src1->data | (uintptr_t) src1->nb[1] | (uintptr_t) src1->nb[2]) % 16 == 0;
+        const int items = aligned ? (int) ((K / 4 + NVFP4_LT_QROW_THREADS - 1) / NVFP4_LT_QROW_THREADS) : 0;
+        const dim3 nrows((unsigned) (n_tok * src1->ne[1]));
+#define NVFP4_LT_QROW(n) k_nvfp4_lt_quantize_rows<n><<<nrows, NVFP4_LT_QROW_THREADS, 0, stream>>>( \
+            (const char *) src1->data, inv_p.ptr, pairs_d, x_q, x_s, row_scale, K, n_used, src1->ne[1], src1->nb[1], src1->nb[2])
+        switch (items) {
+            case 1: NVFP4_LT_QROW(1); break;
+            case 2: NVFP4_LT_QROW(2); break;
+            case 3: NVFP4_LT_QROW(3); break;
+            case 4: NVFP4_LT_QROW(4); break;
+            case 5: NVFP4_LT_QROW(5); break;
+            case 6: NVFP4_LT_QROW(6); break;
+            case 7: NVFP4_LT_QROW(7); break;
+            case 8: NVFP4_LT_QROW(8); break;
+            default:
+                k_nvfp4_lt_quantize_act<<<n_pairs, 128, 0, stream>>>((const char *) src1->data, pairs_d, x_q, x_s, row_scale, K);
+                break;
+        }
+#undef NVFP4_LT_QROW
         CUDA_CHECK(cudaGetLastError());
     }
 
