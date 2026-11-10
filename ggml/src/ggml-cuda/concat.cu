@@ -52,6 +52,18 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_cont(con
     }
 }
 
+// dim 0 with rows of 16 B multiples: 16 B per thread
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_cont_dim0_16b(
+        const int4 * __restrict__ x, const int4 * __restrict__ y, int4 * __restrict__ dst, const uint32_t n, const uint32_t nc0, const uint3 nc_fd) {
+    const uint32_t i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const uint2 rc = fast_div_modulo(i, nc_fd); // row, chunk in row
+    ggml_cuda_pdl_sync();
+    dst[i] = rc.y < nc0 ? x[(int64_t) rc.x*nc0 + rc.y] : y[(int64_t) rc.x*(nc_fd.z - nc0) + rc.y - nc0];
+}
+
 template <typename T>
 static void concat_cont_cuda(const T * x,
                              const T * y,
@@ -67,6 +79,16 @@ static void concat_cont_cuda(const T * x,
     const int64_t n          = ne0 * ne1 * ne2;
     const int     num_blocks = (n + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
 
+    if (dim == 0 && (ne00*sizeof(T)) % 16 == 0 && (ne0*sizeof(T)) % 16 == 0 && n*sizeof(T)/16 < INT_MAX &&
+            ((uintptr_t) x | (uintptr_t) y | (uintptr_t) dst) % 16 == 0) {
+        const int64_t nc = ne0*sizeof(T)/16;
+        const int64_t nn = n*sizeof(T)/16;
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
+            (nn + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE, CUDA_CONCAT_BLOCK_SIZE, 0, stream);
+        ggml_cuda_kernel_launch(concat_cont_dim0_16b, launch_params, (const int4 *) x, (const int4 *) y, (int4 *) dst,
+            (uint32_t) nn, (uint32_t) (ne00*sizeof(T)/16), init_fastdiv_values(nc));
+        return;
+    }
     if (dim == 0) {
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream);
         ggml_cuda_kernel_launch(concat_cont<T, 0>, launch_params, x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
