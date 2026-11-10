@@ -2393,8 +2393,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             {
                 // FIXME: get_rows can use additional threads, but the cost of launching additional threads
                 // decreases performance with GPU offloading
-                //n_tasks = n_threads;
-                n_tasks = 1;
+                // large gathers (e.g. a host table read for a whole batch, dequantized) are worth the threads
+                n_tasks = ggml_nbytes(node) >= (8u << 20) ? n_threads : 1;
             } break;
         case GGML_OP_SCALE:
         case GGML_OP_SET:
