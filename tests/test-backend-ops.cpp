@@ -12426,6 +12426,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_concat(GGML_TYPE_I64, {11, 12, 13, 14}, 7, dim, v));
         }
     }
+    // dim 0 with rows of 16 B multiples (vectorized path)
+    for (int v : { 0, 2 }) {
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F32,  {8, 12, 13, 3}, 4, 0, v));
+        test_cases.emplace_back(new test_concat(GGML_TYPE_BF16, {64, 12, 13, 3}, 8, 0, v));
+        test_cases.emplace_back(new test_concat(GGML_TYPE_F16,  {512, 5, 3, 1}, 64, 0, v));
+    }
 
     for (ggml_type type_a : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
         for (int v : { 0, 4, 8, 12 }) {
