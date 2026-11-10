@@ -4524,6 +4524,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     continue;
                 }
 
+                // cuBLASLt NVFP4 path: per-expert scale in the gate output, scale and GLU in the up output
+                if (!with_bias && ggml_get_op_params_i32(glu, 1) == 0 &&
+                        ggml_cuda_mul_mat_id_nvfp4_lt_applicable(up_n, ggml_cuda_info().devices[cuda_ctx->device].cc) && ggml_cuda_mul_mat_id_nvfp4_lt_applicable(gate_n, ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+                        ggml_are_same_stride(gate_scale_n, gate_n) && ggml_are_same_stride(glu, up_n) && ggml_are_same_shape(glu, up_n) &&
+                        ggml_are_same_shape(gate_n, up_n) && ggml_are_same_stride(gate_n, up_n)) {
+                    ggml_cuda_nvfp4_lt_epilogue epi_gate;
+                    epi_gate.expert_scale = (const float *) gate_scale->data;
+                    epi_gate.out          = gate_scale_n->data;
+                    ggml_cuda_nvfp4_lt_epilogue epi_up;
+                    epi_up.expert_scale = (const float *) up_scale->data;
+                    epi_up.gate         = (const float *) gate_scale_n->data;
+                    epi_up.glu_op       = ggml_get_glu_op(glu);
+                    epi_up.glu_limit    = ggml_get_op_params_f32(glu, 3);
+                    epi_up.out          = cgraph->nodes[glu_idx]->data;
+                    if (ggml_cuda_mul_mat_id_nvfp4_lt(*cuda_ctx, gate_n, &epi_gate)) {
+                        GGML_ASSERT(ggml_cuda_mul_mat_id_nvfp4_lt(*cuda_ctx, up_n, &epi_up));
+                        fused_mul_mat_vec = true;
+                        fused_node_count  = n_ops;
+                        break;
+                    }
+                }
+
                 const ggml_tensor * up_bias   = with_bias ? get_bias_tensor(up_out_n, up_scale_n, bias_op) : nullptr;
                 const ggml_tensor * gate_bias = with_bias ? get_bias_tensor(gate_out_n, gate_scale_n, bias_op) : nullptr;
 

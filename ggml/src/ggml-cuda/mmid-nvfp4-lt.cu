@@ -1,6 +1,7 @@
 // MUL_MAT_ID for NVFP4 weights with the cuBLASLt grouped FP4 GEMM (W4A4, VEC16_UE4M3 block scales).
 // Activations are quantized to NVFP4 with a per-row fp32 scale applied to the output, alpha is 1.
 #include "mmid-nvfp4-lt.cuh"
+#include "unary.cuh"
 
 // needs the cuBLASLt grouped FP4 API, only tried with CUDA 13.3
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(CUDART_VERSION) && CUDART_VERSION >= 13030
@@ -21,7 +22,7 @@ struct nvfp4_lt_pair {
     int64_t dst_off; // byte offset of the dst row
     int64_t sc_base; // byte offset of the expert's activation scales
     int32_t row;     // row inside the expert
-    int32_t pad;
+    int32_t expert;
 };
 
 // scale tile layout: 128 rows x 4 scale columns per 512 bytes, tiles in row-tile major order
@@ -140,17 +141,26 @@ static __global__ void k_nvfp4_lt_quantize_act(
     }
 }
 
+template <bool has_scale, bool has_glu>
 static __global__ void k_nvfp4_lt_scatter(
         const nv_bfloat16 * __restrict__ src, const nvfp4_lt_pair * __restrict__ pairs, const float * __restrict__ row_scale,
-        char * __restrict__ dst, const int64_t N) {
-    if (pairs[blockIdx.x].row < 0) {
+        char * __restrict__ dst, const int64_t N, const float * __restrict__ expert_scale, const char * __restrict__ gate,
+        const ggml_glu_op glu_op, const float glu_limit) {
+    const nvfp4_lt_pair pr = pairs[blockIdx.x];
+    if (pr.row < 0) {
         return;
     }
-    const float g = row_scale[blockIdx.x];
-    float * d = (float *) (dst + pairs[blockIdx.x].dst_off);
+    const float g = row_scale[blockIdx.x] * (has_scale ? expert_scale[pr.expert] : 1.0f);
+    float * d = (float *) (dst + pr.dst_off);
     for (int64_t n = threadIdx.x; n < N; n += blockDim.x) {
-        d[n] = __bfloat162float(src[(int64_t) blockIdx.x * N + n]) * g;
+        const float v = __bfloat162float(src[(int64_t) blockIdx.x * N + n]) * g;
+        if constexpr (has_glu) {
+            d[n] = ggml_cuda_op_glu_single(glu_op, ((const float *) (gate + pr.dst_off))[n], v, glu_limit);
+        } else {
+            d[n] = v;
+        }
     }
+    GGML_UNUSED_VARS(expert_scale, gate, glu_op, glu_limit);
 }
 
 // device side routing: count tokens per expert, prefix sums + cuBLASLt group arrays, then place the pairs sorted by expert
@@ -234,7 +244,7 @@ static __global__ void k_nvfp4_lt_place(const char * __restrict__ ids, const int
     pr.dst_off = u * dst_nb1 + t * dst_nb2;
     pr.sc_base = sc_off[e];
     pr.row     = r;
-    pr.pad     = 0;
+    pr.expert  = e;
     pairs[row_off[e] + r] = pr;
 }
 
@@ -303,7 +313,7 @@ void ggml_cuda_mul_mat_id_nvfp4_lt_free(ggml_backend_cuda_context & ctx) {
     ctx.nvfp4_lt_cache = nullptr;
 }
 
-bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_nvfp4_lt_epilogue * epi) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
@@ -429,7 +439,16 @@ bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor 
     const float alpha = 1.0f, beta = 0.0f;
     LT_CHECK(cublasLtMatmul(lt, op, &alpha, pa, lay[0], pb, lay[1], &beta, pd, lay[2], pd, lay[2], &hr.algo, (void *) (((uintptr_t) work.ptr + 255) & ~(uintptr_t) 255), ws, stream));
 
-    k_nvfp4_lt_scatter<<<n_pairs, 256, 0, stream>>>(y.ptr, pairs_d, row_scale, (char *) dst->data, N);
+    char * out = epi && epi->out ? (char *) epi->out : (char *) dst->data;
+    if (epi && epi->gate) {
+        GGML_ASSERT(epi->expert_scale);
+        k_nvfp4_lt_scatter<true, true><<<n_pairs, 256, 0, stream>>>(y.ptr, pairs_d, row_scale, out, N, epi->expert_scale,
+            (const char *) epi->gate, epi->glu_op, epi->glu_limit);
+    } else if (epi && epi->expert_scale) {
+        k_nvfp4_lt_scatter<true, false><<<n_pairs, 256, 0, stream>>>(y.ptr, pairs_d, row_scale, out, N, epi->expert_scale, nullptr, epi->glu_op, 0.0f);
+    } else {
+        k_nvfp4_lt_scatter<false, false><<<n_pairs, 256, 0, stream>>>(y.ptr, pairs_d, row_scale, out, N, nullptr, nullptr, GGML_GLU_OP_SWIGLU, 0.0f);
+    }
     CUDA_CHECK(cudaGetLastError());
 
     // free the cublasLt objects only after the stream is done with the host side arguments
@@ -444,7 +463,7 @@ bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor 
 #else
 
 bool ggml_cuda_mul_mat_id_nvfp4_lt_applicable(const ggml_tensor *, int) { return false; }
-bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context &, ggml_tensor *) { return false; }
+bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context &, ggml_tensor *, const ggml_cuda_nvfp4_lt_epilogue *) { return false; }
 void ggml_cuda_mul_mat_id_nvfp4_lt_invalidate(ggml_backend_cuda_context &) {}
 void ggml_cuda_mul_mat_id_nvfp4_lt_free(ggml_backend_cuda_context &) {}
 
