@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 
 static bool ggml_is_power_of_2(int n) {
@@ -1731,7 +1732,12 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * 
 
         const int32_t * rows = rows_all ? rows_all + s*n_kv : nullptr;
 
-        for (uint32_t ii = 0; ii < n_tps; ++ii) {
+        // position of each recorded cell of a sequence, or pos_none if the cell is not visible to the sequence
+        constexpr llama_pos pos_none = std::numeric_limits<llama_pos>::min();
+        std::unordered_map<llama_seq_id, std::vector<llama_pos>> seq_idxs_pos;
+
+        // one mask row; prev: start from the first row of the sequence (srct) and update only its cells in idxs
+        auto do_row = [&](const uint32_t ii, const bool prev, const uint32_t srct, std::vector<uint32_t> & idxs) {
             const uint32_t i = s*n_tps + ii;
 
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
@@ -1756,24 +1762,24 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * 
             // keep track of those cells and shortcut the loop to save time
             // note: this optimization is not compatible with Alibi position encoding
             // ref:  https://github.com/ggml-org/llama.cpp/pull/18842
-            bool prev = false;
+            if (prev) {
+                const uint64_t idst_prev = n_kv*srct;
 
-            auto & idxs = seq_idxs[seq_id];
+                std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
 
-            if (!alibi) {
-                if (seq_srct.find(seq_id) != seq_srct.end()) {
-                    const uint32_t srct = seq_srct[seq_id];
-
-                    const uint64_t idst_prev = n_kv*srct;
-
-                    std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
-
-                    prev = true;
-                } else {
-                    idxs.clear();
-                    idxs.reserve(ubatch->n_tokens + n_swa + 32);
-
-                    seq_srct[seq_id] = i;
+                // the recorded cells with their positions looked up once per sequence
+                if (!is_2d) {
+                    const std::vector<llama_pos> & idxs_pos = seq_idxs_pos.at(seq_id);
+                    for (size_t k = 0; k < idxs.size(); ++k) {
+                        const llama_pos p0c = idxs_pos[k];
+                        bool keep = p0c != pos_none && (!causal || p0c <= p1);
+                        if (keep && swa) {
+                            const bool in_span = !causal && args.hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_FULL && p0c >= seq_pos_min[seq_id];
+                            keep = in_span || !llama_hparams::is_masked_swa(n_swa, swa_type, p0c, p1);
+                        }
+                        data[idst + idxs[k]] = keep ? mask_keep : mask_drop;
+                    }
+                    return;
                 }
             }
 
@@ -1782,14 +1788,12 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * 
                 uint32_t c = jj;
 
                 // we have an exiting mask for this sequence -> update just seq_idxs
-                if (!alibi) {
-                    if (prev) {
-                        if (jj >= idxs.size()) {
-                            break;
-                        }
-
-                        c = idxs[jj];
+                if (prev) {
+                    if (jj >= idxs.size()) {
+                        break;
                     }
+
+                    c = idxs[jj];
                 }
 
                 // cell of the column, negative for padding
@@ -1852,6 +1856,63 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * 
 skip:
                 data[idst + c] = mask_drop;
             }
+        };
+
+        // the first row of each sequence in order (it records the cells to update), then the other rows,
+        // which read only that row and its cell list, in parallel when the mask is large
+        std::vector<uint32_t> rest;
+        for (uint32_t ii = 0; ii < n_tps; ++ii) {
+            const llama_seq_id seq_id = ubatch->seq_id[s*n_tps + ii][0];
+            if (!alibi && seq_srct.find(seq_id) != seq_srct.end()) {
+                rest.push_back(ii);
+                continue;
+            }
+            auto & idxs = seq_idxs[seq_id];
+            if (!alibi) {
+                idxs.clear();
+                idxs.reserve(ubatch->n_tokens + n_swa + 32);
+                seq_srct[seq_id] = s*n_tps + ii;
+            }
+            do_row(ii, false, 0, idxs);
+        }
+
+        if (!alibi && !is_2d) {
+            for (const auto & it : seq_idxs) {
+                const auto & cells = v_cells.at(seq_to_stream[it.first]);
+                std::vector<llama_pos> & idxs_pos = seq_idxs_pos[it.first];
+                idxs_pos.resize(it.second.size());
+                for (size_t k = 0; k < it.second.size(); ++k) {
+                    const uint32_t c = it.second[k];
+                    const int32_t  j = rows ? rows[c] : (int32_t) c;
+                    idxs_pos[k] = j < 0 || cells.is_empty(j) || !cells.seq_has(j, it.first) ? pos_none : cells.pos_get(j);
+                }
+            }
+        }
+
+        auto do_rest = [&](const size_t r0, const size_t r1) {
+            for (size_t r = r0; r < r1; ++r) {
+                const llama_seq_id seq_id = ubatch->seq_id[s*n_tps + rest[r]][0];
+                do_row(rest[r], true, seq_srct.at(seq_id), seq_idxs.at(seq_id));
+            }
+        };
+
+        const int n_threads = (int) std::min<size_t>(std::max(1u, std::thread::hardware_concurrency()) / 2, 16);
+        if (n_threads > 1 && (uint64_t) rest.size() * n_kv >= (1u << 22)) {
+            std::vector<std::thread> workers;
+            const size_t chunk = (rest.size() + n_threads - 1) / n_threads;
+            for (int t = 1; t < n_threads; ++t) {
+                const size_t r0 = std::min(rest.size(), t*chunk);
+                const size_t r1 = std::min(rest.size(), r0 + chunk);
+                if (r0 < r1) {
+                    workers.emplace_back(do_rest, r0, r1);
+                }
+            }
+            do_rest(0, std::min(rest.size(), chunk));
+            for (auto & w : workers) {
+                w.join();
+            }
+        } else {
+            do_rest(0, rest.size());
         }
     }
 }
