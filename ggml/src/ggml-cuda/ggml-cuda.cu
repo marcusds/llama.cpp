@@ -4150,6 +4150,29 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // RMS_NORM (no weight) whose only use is a matrix product with a smaller output: the product of the
+    // unnormalized rows is scaled by 1/rms afterwards, so the normalized tensor is never written
+    if (node->op == GGML_OP_RMS_NORM && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT) {
+        ggml_tensor * mm = cgraph->nodes[i + 1];
+        ggml_tensor * x  = node->src[0];
+        const int out_idx_mm = i + 1;
+        const ggml_op ops_nm[2] = { GGML_OP_RMS_NORM, GGML_OP_MUL_MAT };
+        if (ggml_can_fuse_subgraph(cgraph, i, 2, ops_nm, &out_idx_mm, 1) && mm->src[1] == node && mm->src[0] != node && x->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(x) && ggml_is_contiguous(mm) && x->ne[0] % 4 == 0 && ggml_cuda_is_aligned(x, 16) &&
+                ggml_nrows(mm) == ggml_nrows(x) && ggml_nelements(mm) < ggml_nelements(x) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, &out_idx_mm, 1)) {
+            float eps;
+            memcpy(&eps, node->op_params, sizeof(float));
+            ggml_cuda_pool_alloc<float> inv(cuda_ctx->pool(), ggml_nrows(x));
+            ggml_cuda_rms_norm_inv(*cuda_ctx, x, eps, inv.ptr);
+            mm->src[1] = x;
+            ggml_cuda_mul_mat(*cuda_ctx, mm->src[0], x, mm);
+            mm->src[1] = node;
+            ggml_cuda_scale_rows(*cuda_ctx, mm, inv.ptr);
+            return 1;
+        }
+    }
+
     // NVFP4 down projection on cuBLASLt: the per-expert scale, the router weights and the sum over the used
     // experts are applied while reading the GEMM output (MUL_MAT_ID, scale RESHAPE/REPEAT/GET_ROWS/MUL, weighted reduction)
     if (node->op == GGML_OP_MUL_MAT_ID && i + 5 < cgraph->n_nodes &&

@@ -18,3 +18,7 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
 void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// for an RMS norm folded into the following matrix product: 1/rms of each row of x, and rows of dst scaled by s
+void ggml_cuda_rms_norm_inv(ggml_backend_cuda_context & ctx, const ggml_tensor * x, float eps, float * inv);
+void ggml_cuda_scale_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float * s);
