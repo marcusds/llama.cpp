@@ -503,6 +503,71 @@ static bool ggml_is_view_op(enum ggml_op op) {
     return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
 }
 
+// Allocates the weight tensors like llama does: each one in the first extra buffer type of the backend's device
+// that supports all the ops using it (e.g. a repacked layout), the others in the default buffer type.
+static bool alloc_weight_tensors(ggml_context * ctx_weights, ggml_context * ctx, ggml_backend_t backend,
+        std::vector<ggml_backend_buffer_ptr> & bufs) {
+    std::vector<ggml_backend_buffer_type_t> bufts;
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto get_extra_bufts = reg ? (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts") : nullptr;
+    if (get_extra_bufts) {
+        for (ggml_backend_buffer_type_t * p = get_extra_bufts(dev); p && *p; ++p) {
+            bufts.push_back(*p);
+        }
+    }
+    const size_t n_extra = bufts.size();
+    bufts.push_back(ggml_backend_get_default_buffer_type(backend));
+
+    std::vector<std::vector<ggml_tensor *>> sel(bufts.size());
+    for (ggml_tensor * w = ggml_get_first_tensor(ctx_weights); w != nullptr; w = ggml_get_next_tensor(ctx_weights, w)) {
+        size_t ib = n_extra;
+        for (size_t i = 0; i < n_extra; ++i) {
+            // a zero sized buffer of the type, so that supports_op can check it
+            w->buffer = ggml_backend_buft_alloc_buffer(bufts[i], 0);
+            bool ok = true;
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr && ok; t = ggml_get_next_tensor(ctx, t)) {
+                for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                    if (t->src[j] == w && !ggml_backend_supports_op(backend, t)) {
+                        ok = false;
+                    }
+                }
+            }
+            ggml_backend_buffer_free(w->buffer);
+            w->buffer = nullptr;
+            if (ok) {
+                ib = i;
+                break;
+            }
+        }
+        sel[ib].push_back(w);
+    }
+
+    for (size_t i = 0; i < bufts.size(); ++i) {
+        if (sel[i].empty()) {
+            continue;
+        }
+        const size_t align = ggml_backend_buft_get_alignment(bufts[i]);
+        size_t size = align;
+        for (ggml_tensor * t : sel[i]) {
+            size += GGML_PAD(ggml_backend_buft_get_alloc_size(bufts[i], t), align);
+        }
+        ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(bufts[i], size);
+        if (buf == nullptr) {
+            return false;
+        }
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        bufs.emplace_back(buf);
+        ggml_tallocr talloc = ggml_tallocr_new(buf);
+        for (ggml_tensor * t : sel[i]) {
+            if (ggml_tallocr_alloc(&talloc, t) != GGML_STATUS_SUCCESS) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool backend_has_feature(ggml_backend_t backend, const char * feature_name) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
@@ -1506,14 +1571,12 @@ struct test_case {
             add_sentinel(ctx_weights.get());
         }
 
-        ggml_backend_buffer_ptr buf_weights(nullptr);
+        std::vector<ggml_backend_buffer_ptr> buf_weights;
         if (ctx_weights) {
-            buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend1));
-            if (buf_weights == NULL) {
+            if (!alloc_weight_tensors(ctx_weights.get(), ctx.get(), backend1, buf_weights)) {
                 printf("failed to allocate weight tensors [%s] ", ggml_backend_name(backend1));
                 return test_status_t::FAIL;
             }
-            ggml_backend_buffer_set_usage(buf_weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         }
 
         // allocate
@@ -1691,14 +1754,12 @@ struct test_case {
             return true;
         }
 
-        ggml_backend_buffer_ptr buf_weights(nullptr);
+        std::vector<ggml_backend_buffer_ptr> buf_weights;
         if (ctx_weights) {
-            buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend));
-            if (buf_weights == NULL) {
+            if (!alloc_weight_tensors(ctx_weights.get(), ctx.get(), backend, buf_weights)) {
                 printf("failed to allocate weight tensors\n");
                 return false;
             }
-            ggml_backend_buffer_set_usage(buf_weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         }
 
         // allocate
@@ -5734,10 +5795,14 @@ struct test_mul_mat_id : public test_case {
     const int64_t m_v; // rows of as in memory, the experts of as are strided for m_v > m, no view for m_v == 0
     const bool ids_offset;
     const bool skip; // set some ids to a negative value
+    const bool weights; // as in the weights context (e.g. a device extra buffer type)
+    ggml_context * ctx_as = nullptr;
 
     std::string vars() override {
-        return VARS_TO_STR11(type_a, type_b, n_mats, n_used, b, m, n, k, m_v, ids_offset, skip);
+        return VARS_TO_STR11(type_a, type_b, n_mats, n_used, b, m, n, k, m_v, ids_offset, skip) + (weights ? ",weights=1" : "");
     }
+
+    bool use_weight_context() override { return weights; }
 
     double max_nmse_err() override {
         return 5e-4;
@@ -5747,7 +5812,7 @@ struct test_mul_mat_id : public test_case {
         // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) &&
                 !graph_mul_mat_hi_prec_act(gf, GGML_OP_MUL_MAT_ID) &&
-                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+                (backend_has_feature(backend, "BLACKWELL_NATIVE_FP4") || (type_a == GGML_TYPE_NVFP4 && getenv("GGML_CUDA_NVFP4_CUBLASLT")))) {
             return 2e-2;
         }
         if (type_a == GGML_TYPE_F8_E4M3 && backend_has_feature(backend, "NATIVE_FP8")) {
@@ -5764,16 +5829,21 @@ struct test_mul_mat_id : public test_case {
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
             int64_t m = 32, int64_t n = 32, int64_t k = 32,
-            int64_t m_v = 0, bool ids_offset = false, bool skip = false)
+            int64_t m_v = 0, bool ids_offset = false, bool skip = false, bool weights = false)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), m_v(m_v), ids_offset(ids_offset), skip(skip) {
+            m(m), n(n), k(k), m_v(m_v), ids_offset(ids_offset), skip(skip), weights(weights) {
             GGML_ASSERT(n_used <= n_mats);
             GGML_ASSERT(m_v == 0 || m_v > m);
         }
 
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ctx_as = ctx_weights;
+        return build_graph(ctx);
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // C^T = A * B^T: (k, m) * (k, n) => (m, n)
-        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m_v == 0 ? m : m_v, n_mats);
+        ggml_tensor * as = ggml_new_tensor_3d(ctx_as ? ctx_as : ctx, type_a, k, m_v == 0 ? m : m_v, n_mats);
         if (m_v != 0) {
             as = ggml_view_3d(ctx, as, k, m, n_mats, as->nb[1], as->nb[2], 0);
         }
@@ -5801,6 +5871,36 @@ struct test_mul_mat_id : public test_case {
 
     void reinit_perf_iter(ggml_context * ctx) override {
         init_mul_mat_id_ids(ctx, n_mats, skip);
+    }
+};
+
+// MoE down projection: MUL_MAT_ID, per-expert scale (RESHAPE/REPEAT/GET_ROWS/MUL), router weights, sum over the used experts
+struct test_mul_mat_id_down_reduce : public test_mul_mat_id {
+    using test_mul_mat_id::test_mul_mat_id;
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_REDUCE";
+    }
+    bool run_whole_graph() override { return true; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat_id::build_graph(ctx);
+        ggml_tensor * ids = out->src[2];
+        ggml_tensor * w_s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_mats);
+        ggml_set_name(w_s, "w_s");
+        ggml_tensor * s = ggml_reshape_3d(ctx, w_s, 1, n_mats, 1);
+        s = ggml_repeat_4d(ctx, s, 1, n_mats, n, 1);
+        s = ggml_get_rows(ctx, s, ids);
+        out = ggml_mul(ctx, out, s);
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
+        ggml_set_name(weights, "weights");
+        out = ggml_mul(ctx, out, weights);
+        ggml_tensor * sum = nullptr;
+        for (int u = 0; u < n_used; ++u) {
+            ggml_tensor * v = ggml_view_2d(ctx, out, m, n, out->nb[2], u * out->nb[1]);
+            sum = sum ? ggml_add(ctx, sum, v) : v;
+        }
+        ggml_set_name(sum, "moe_out");
+        return sum;
     }
 };
 
@@ -5948,26 +6048,33 @@ struct test_mul_mat_id_fusion : public test_case {
 struct test_mul_mat_id_shared : public test_case {
     const ggml_type type;
     const int64_t n;
+    const bool weights; // the expert weights in the weights context
     ggml_tensor * routed = nullptr;
     ggml_tensor * shared = nullptr;
 
-    test_mul_mat_id_shared(ggml_type type, int64_t n) : type(type), n(n) {}
+    test_mul_mat_id_shared(ggml_type type, int64_t n, bool weights = false) : type(type), n(n), weights(weights) {}
 
-    std::string vars() override { return VARS_TO_STR2(type, n); }
+    std::string vars() override { return VARS_TO_STR2(type, n) + (weights ? ",weights=1" : ""); }
+    bool use_weight_context() override { return weights; }
     std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_SHARED"; }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { routed, shared }; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, nullptr);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_context * ctx_w = ctx_weights ? ctx_weights : ctx;
         ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, n);
         ggml_tensor * input_ids = ggml_reshape_3d(ctx, input, 512, 1, n);
         ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 3, n);
         ggml_set_name(ids, "ids");
-        ggml_tensor * up = ggml_new_tensor_3d(ctx, type, 512, 128, 8);
-        ggml_tensor * gate = ggml_new_tensor_3d(ctx, type, 512, 128, 8);
-        ggml_tensor * shared_up = ggml_new_tensor_2d(ctx, type, 512, 128);
-        ggml_tensor * shared_gate = ggml_new_tensor_2d(ctx, type, 512, 128);
+        ggml_tensor * up = ggml_new_tensor_3d(ctx_w, type, 512, 128, 8);
+        ggml_tensor * gate = ggml_new_tensor_3d(ctx_w, type, 512, 128, 8);
+        ggml_tensor * shared_up = ggml_new_tensor_2d(ctx_w, type, 512, 128);
+        ggml_tensor * shared_gate = ggml_new_tensor_2d(ctx_w, type, 512, 128);
         routed = ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, gate, input_ids, ids), ggml_mul_mat_id(ctx, up, input_ids, ids));
         shared = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, shared_gate, input), ggml_mul_mat(ctx, shared_up, input));
         return ggml_add(ctx, routed, ggml_reshape_3d(ctx, shared, 128, 1, n));
@@ -8152,8 +8259,8 @@ struct test_mul_mat_vec_fusion : public test_case {
             ggml_set_name(out, "out");
             return out;
         } else {
-            ggml_tensor * gates = ggml_new_tensor_3d(ctx, type, k, n, n_mats);
-            ggml_tensor * ups   = ggml_new_tensor_3d(ctx, type, k, n, n_mats);
+            ggml_tensor * gates = ggml_new_tensor_3d(ctx_weights ? ctx_weights : ctx, type, k, n, n_mats);
+            ggml_tensor * ups   = ggml_new_tensor_3d(ctx_weights ? ctx_weights : ctx, type, k, n, n_mats);
             ggml_tensor * ids   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, m);
 
             if (n_used != n_mats) {
@@ -8217,6 +8324,10 @@ struct test_mul_mat_vec_fusion : public test_case {
 
     double max_nmse_err(ggml_backend_t backend) override {
         // 4-bit activations on Blackwell, see test_mul_mat
+        // the cuBLASLt NVFP4 MUL_MAT_ID path (opt-in) also quantizes the activations, the GLU multiplies two such results
+        if (type == GGML_TYPE_NVFP4 && use_id && m > 16 && getenv("GGML_CUDA_NVFP4_CUBLASLT")) {
+            return 5e-2;
+        }
         if (type == GGML_TYPE_NVFP4 && !graph_mul_mat_hi_prec_act(gf, use_id ? GGML_OP_MUL_MAT_ID : GGML_OP_MUL_MAT) &&
                 backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
@@ -11644,6 +11755,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 4, 2, true,  64, 16, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_NVFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_NVFP4, GGML_TYPE_F32, 4, 2, true,  64, 16, 256));
+    // large batch, uneven and empty experts (cuBLASLt grouped path)
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 16, 2, false, 256, 300, 512));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 64, 4, true,  256, 300, 512));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 384, 6, false, 2304, 3748, 5120));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 384, 6, true,  2304, 600, 5120));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 6, false, 1024, 300, 2304));
+    // down projection with scale, router weights and the expert sum (fused on the cuBLASLt path)
+    for (int n : {8, 33, 300}) {
+        test_cases.emplace_back(new test_mul_mat_id_down_reduce(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 6, false, 1024, n, 512));
+    }
+    test_cases.emplace_back(new test_mul_mat_id_down_reduce(GGML_TYPE_NVFP4, GGML_TYPE_F32, 64, 6, false, 256, 40, 256, 0, false, true));
+    // small batches just above the MMVQ limit
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 64, 6, false, 256, 17, 512));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 256, 6, false, 512, 40, 1024));
+    // NVFP4 experts in the weights context: a device extra buffer type (e.g. the CUDA NVFP4 split layout) can hold them
+    for (int n : {1, 4, 8, 12, 16, 17, 300}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 16, 4, false, 256, n, 512, 0, false, false, true));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 16, 4, true,  256, n, 512, 0, false, false, true));
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 16, 4, false, 256, 8, 512, 0, false, true, true));
+    for (int n : {8, 300}) {
+        test_cases.emplace_back(new test_mul_mat_id_down_reduce(GGML_TYPE_NVFP4, GGML_TYPE_F32, 64, 6, false, 256, n, 512, 0, false, false, true));
+    }
     test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 64, 16, 512));
     test_cases.emplace_back(new test_mul_mat_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 32, 256));
@@ -12018,6 +12152,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t n : { 1, 2, 3, 4, 8, 9 }) {
             test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
         }
+    }
+    for (int64_t n : { 1, 4 }) {
+        test_cases.emplace_back(new test_mul_mat_id_shared(GGML_TYPE_NVFP4, n, true));
     }
 
     // gpt-oss issue with Vulkan mmq_id
@@ -12968,6 +13105,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             true, 16, 8, b, false, true, false));
     }
 
+    // NVFP4 gate and up above 16 tokens (cuBLASLt path on cc 10.x), with and without a per-expert scale in between
+    for (bool with_lane_scale : {false, true}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_NVFP4, GGML_GLU_OP_SWIGLU_CLAMP, 64, 256, 256,
+            true, 16, 8, false, false, true, with_lane_scale, {1, 1}));
+    }
+    // up alone with its per-expert scale (the gate in another graph split, as with CPU experts)
+    for (bool b : {false, true}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_NVFP4, GGML_GLU_OP_SWIGLU, 64, 256, 256,
+            true, 16, 8, b, false, false, true, {1, 1}));
+    }
+
     // Gate and up on the SYCL XMX kernels: rows long enough for 2D block loads, a last tile of 8 rows, and
     // columns on both sides of the 8 and 16 column tiles
     for (ggml_type type : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
@@ -13014,6 +13162,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // The same with experts (~1280 tiles each): 17 tokens with broadcast input (one MMA tile per warp), 2048 tokens without (two, several column tiles per expert).
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K,   GGML_GLU_OP_SWIGLU,        17,  5120, 256, true, 16, 8, true));
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0,   GGML_GLU_OP_SWIGLU,      2048,   128, 256, true, 40, 8, false));
+    // NVFP4 experts with per-expert weight scales in the weights context (MMVQ and cuBLASLt sizes).
+    for (int64_t m_batch : {1, 4, 8, 40}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_NVFP4, GGML_GLU_OP_SWIGLU, m_batch, 256, 512, true, 16, 4, false, false, true, true));
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_NVFP4, GGML_GLU_OP_SWIGLU, m_batch, 256, 512, true, 16, 4, false, false, false, true));
+    }
     // NVFP4 with experts, without and with per-expert weight scales.
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_NVFP4,  GGML_GLU_OP_SWIGLU,       150,  2560, 256, true, 16, 8, false));
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_NVFP4,  GGML_GLU_OP_SWIGLU,        17,  5120, 256, true, 16, 8, true,  false, true, true));
