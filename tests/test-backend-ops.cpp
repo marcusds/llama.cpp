@@ -7935,6 +7935,27 @@ struct test_moe_reduce : public test_case {
     }
 };
 
+// RMS_NORM without weight feeding a matrix product (DeepSeek-V4 hyper-connection mixes)
+struct test_rms_norm_mul_mat : public test_case {
+    const ggml_type type_w;
+    const int64_t k, m, n;
+    std::string vars() override { return VARS_TO_STR4(type_w, k, m, n); }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "RMS_NORM_MUL_MAT"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    test_rms_norm_mul_mat(ggml_type type_w = GGML_TYPE_F32, int64_t k = 20480, int64_t m = 24, int64_t n = 33)
+        : type_w(type_w), k(k), m(m), n(n) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type_w, k, m);
+        ggml_set_name(w, "w");
+        ggml_tensor * out = ggml_mul_mat(ctx, w, ggml_rms_norm(ctx, x, 1e-6f));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // mul_mat with src1 in [0, 1]: a zero-mean src1 hides errors in the zero point or the min of a quantized src0
 struct test_mul_mat_pos : public test_mul_mat {
     using test_mul_mat::test_mul_mat;
@@ -11401,6 +11422,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
     test_cases.emplace_back(new test_silu_back());
 
+    for (ggml_type type_w : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+        for (int64_t n : { 1, 33, 512 }) {
+            test_cases.emplace_back(new test_rms_norm_mul_mat(type_w, 20480, 24, n));
+        }
+    }
+    test_cases.emplace_back(new test_rms_norm_mul_mat(GGML_TYPE_F32, 256, 512, 16)); // wider output: not folded
+
+    // rows of 16K-32K floats (e.g. DeepSeek-V4 hyper-connection norms over 4 x n_embd)
+    for (int64_t n : { 20480, 32768 }) {
+        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { n, 5, 2, 1 }, false, 1e-6f));
+    }
+
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 10.f }) {
         for (uint32_t n : { 64, 1025 }) {
             for (bool v : { false, true }) {
@@ -13240,6 +13273,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t n_tokens : {1, 512}) {
         test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {4096, n_tokens, 1, 1}));
         test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {128, 32*n_tokens, 1, 1}));
+        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {20480, n_tokens, 1, 1}));
         test_cases.emplace_back(new test_rms_norm_mul_rope({4096, n_tokens, 1, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_NORMAL, true, false));
         test_cases.emplace_back(new test_rms_norm_mul_rope({128, 32, n_tokens, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_NEOX));
         test_cases.emplace_back(new test_rms_norm_mul_rope({128, 8, n_tokens, 1}, 1e-6f, false, true, true, GGML_ROPE_TYPE_NEOX));

@@ -438,6 +438,8 @@ static void rms_norm_f32_dispatch(
             RMS_NORM_LAUNCH(1024, 1, true);
         } else if (n4 <= 4096) {
             RMS_NORM_LAUNCH(1024, 4, true);
+        } else if (n4 <= 8192) {
+            RMS_NORM_LAUNCH(1024, 8, true);
         } else {
             RMS_NORM_LAUNCH(1024, 1, false);
         }
@@ -543,6 +545,39 @@ static void l2_norm_f32_cuda(
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
         ggml_cuda_kernel_launch(l2_norm_f32<1024>, launch_params, x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps);
     }
+}
+
+// 1/sqrt(mean(x^2) + eps) of each row of a contiguous x with ncols % 4 == 0 (same reduction as rms_norm_f32)
+static __global__ void rms_norm_inv_f32(const float4 * __restrict__ x, float * __restrict__ inv, const int ncols, const float eps) {
+    extern __shared__ float s_sum[];
+    const float4 * xr = x + (int64_t) blockIdx.x * (ncols/4);
+    float tmp = 0.0f;
+    for (int i = threadIdx.x; i < ncols/4; i += 1024) {
+        const float4 v = xr[i];
+        tmp += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
+    }
+    tmp = block_reduce<block_reduce_method::SUM, 1024>(tmp, s_sum);
+    if (threadIdx.x == 0) {
+        inv[blockIdx.x] = rsqrtf(tmp / ncols + eps);
+    }
+}
+
+static __global__ void scale_rows_f32(float * __restrict__ x, const float * __restrict__ s, const int64_t ncols, const int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        x[i] *= s[i / ncols];
+    }
+}
+
+void ggml_cuda_rms_norm_inv(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const float eps, float * inv) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && x->ne[0] % 4 == 0);
+    rms_norm_inv_f32<<<ggml_nrows(x), 1024, 32*sizeof(float), ctx.stream()>>>((const float4 *) x->data, inv, x->ne[0], eps);
+}
+
+void ggml_cuda_scale_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float * s) {
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst));
+    const int64_t n = ggml_nelements(dst);
+    scale_rows_f32<<<(n + 255) / 256, 256, 0, ctx.stream()>>>((float *) dst->data, s, dst->ne[0], n);
 }
 
 void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
