@@ -438,6 +438,8 @@ static void rms_norm_f32_dispatch(
             RMS_NORM_LAUNCH(1024, 1, true);
         } else if (n4 <= 4096) {
             RMS_NORM_LAUNCH(1024, 4, true);
+        } else if (n4 <= 8192) {
+            RMS_NORM_LAUNCH(1024, 8, true);
         } else {
             RMS_NORM_LAUNCH(1024, 1, false);
         }
