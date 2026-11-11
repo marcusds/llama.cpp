@@ -167,6 +167,7 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+    GGML_ASSERT(!ggml_cuda_nvfp4_split_tensor(src0));
 
     // Fused gate/up/GLU: src0 is the up weight, dst the GLU output.
     const ggml_tensor * gate = fusion ? fusion->gate : nullptr;
