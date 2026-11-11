@@ -22,3 +22,10 @@ bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor 
 // call at the start of each graph compute: drops the cached activations unless the graph continues the previous one
 void ggml_cuda_mul_mat_id_nvfp4_lt_graph_begin(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph);
 void ggml_cuda_mul_mat_id_nvfp4_lt_free(ggml_backend_cuda_context & ctx);
+
+// NVFP4 split layout (weights in the CUDA NVFP4 split buffer type): the 32 value bytes of all blocks
+// in block order, then the 4 scale bytes of all blocks; block i of the tensor has its values at
+// 32*i and its scales at 32*nblocks + 4*i. Converts nblocks ggml blocks from src (device) to dst.
+void ggml_cuda_nvfp4_split_convert(const void * src, void * dst, int64_t nblocks, cudaStream_t stream);
+// the inverse: nblocks blocks in the split layout from src (device) to the ggml layout in dst
+void ggml_cuda_nvfp4_split_unconvert(const void * src, void * dst, int64_t nblocks, cudaStream_t stream);

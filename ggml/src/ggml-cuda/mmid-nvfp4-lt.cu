@@ -2,6 +2,7 @@
 // Activations are quantized to NVFP4 with a per-row fp32 scale applied to the output, alpha is 1.
 #include "mmid-nvfp4-lt.cuh"
 #include "unary.cuh"
+#include "mmvq.cuh"
 
 // needs the cuBLASLt grouped FP4 API, only tried with CUDA 13.3
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(CUDART_VERSION) && CUDART_VERSION >= 13030
@@ -67,6 +68,34 @@ static __global__ void __launch_bounds__(512) k_nvfp4_lt_repack_weights(
     if (blockIdx.x * 4 + c < nkb) {
         uint32_t * s = (uint32_t *) (dst_s + a * N * (K / 16) + ((int64_t) blockIdx.y * nkb + blockIdx.x * 4 + c) * 512);
         s[threadIdx.x % 128] = sc[c][threadIdx.x % 128];
+    }
+}
+
+// split layout scales ([E][N][nkb] uint32, 4 ue4m3 per 64 values) -> scale tiles; a CUDA block does one
+// 128 row tile of one expert: the tile's rows are contiguous in src, read in chunks of 32 k-blocks
+static __global__ void __launch_bounds__(256) k_nvfp4_lt_swizzle_scales(
+        const uint32_t * __restrict__ src, const int32_t * __restrict__ counts, uint32_t * __restrict__ dst, const int64_t N, const int nkb) {
+    const int64_t e = blockIdx.y;
+    if (counts[e] == 0) {
+        return;
+    }
+    const int64_t rt = blockIdx.x;
+    __shared__ uint32_t sm[128][33];
+    const uint32_t * s = src + (e * N + rt * 128) * nkb;
+    uint32_t * d = dst + e * N * nkb + rt * nkb * 128;
+    for (int kb0 = 0; kb0 < nkb; kb0 += 32) {
+        const int nk = min(32, nkb - kb0);
+        for (int i = threadIdx.x; i < 128 * nk; i += blockDim.x) {
+            const int r = i / nk, c = i % nk;
+            sm[r][c] = s[(int64_t) r * nkb + kb0 + c];
+        }
+        __syncthreads();
+        // tile entry p holds row (p % 128 / 4) + 32 * (p % 4), see nvfp4_lt_scale_off
+        for (int i = threadIdx.x; i < 128 * nk; i += blockDim.x) {
+            const int c = i / 128, p = i % 128;
+            d[(int64_t) (kb0 + c) * 128 + p] = sm[p / 4 + 32 * (p % 4)][c];
+        }
+        __syncthreads();
     }
 }
 
@@ -344,17 +373,55 @@ static __global__ void k_nvfp4_lt_place(const char * __restrict__ ids, const int
     inv[p] = row_off[e] + r;
 }
 
+static __global__ void k_nvfp4_split_convert(const uint32_t * __restrict__ src, uint32_t * __restrict__ dst, const int64_t nb) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nb) {
+        return;
+    }
+    const uint32_t * p = src + i * 9;
+    uint4 * q = (uint4 *) (dst + i * 8);
+    q[0] = make_uint4(p[1], p[2], p[3], p[4]);
+    q[1] = make_uint4(p[5], p[6], p[7], p[8]);
+    dst[nb * 8 + i] = p[0];
+}
+
+static __global__ void k_nvfp4_split_unconvert(const uint32_t * __restrict__ src, uint32_t * __restrict__ dst, const int64_t nb) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nb) {
+        return;
+    }
+    const uint4 * q = (const uint4 *) (src + i * 8);
+    const uint4 a = q[0], b = q[1];
+    uint32_t * p = dst + i * 9;
+    p[0] = src[nb * 8 + i];
+    p[1] = a.x; p[2] = a.y; p[3] = a.z; p[4] = a.w;
+    p[5] = b.x; p[6] = b.y; p[7] = b.z; p[8] = b.w;
+}
+
+void ggml_cuda_nvfp4_split_unconvert(const void * src, void * dst, const int64_t nblocks, cudaStream_t stream) {
+    k_nvfp4_split_unconvert<<<(nblocks + 255) / 256, 256, 0, stream>>>((const uint32_t *) src, (uint32_t *) dst, nblocks);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_nvfp4_split_convert(const void * src, void * dst, const int64_t nblocks, cudaStream_t stream) {
+    k_nvfp4_split_convert<<<(nblocks + 255) / 256, 256, 0, stream>>>((const uint32_t *) src, (uint32_t *) dst, nblocks);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 bool ggml_cuda_mul_mat_id_nvfp4_lt_applicable(const ggml_tensor * dst, const int cc) {
     const char * env = getenv("GGML_CUDA_NVFP4_CUBLASLT");
     const bool enabled = env != nullptr && atoi(env) != 0;
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
+    // split layout weights (see mmid-nvfp4-lt.cuh) have no other path above the MMVQ limit
+    const int64_t min_tokens = ggml_cuda_nvfp4_split_tensor(src0) ? get_mmvq_mmid_max_batch(GGML_TYPE_NVFP4, cc) : 16;
+
     // above 16 tokens: smaller batches stay on MMVQ, from 17 tokens on this beats MMQ (17-32 streams, 30-250 token prompts)
     return enabled && cc >= 1000 && cc < 1100 &&
         src0->type == GGML_TYPE_NVFP4 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
         ggml_get_op_params_i32(dst, 3) != GGML_PREC_Q8 && // Q8 activations requested
-        src1->ne[2] > 16 && src0->ne[0] % 64 == 0 && src0->ne[1] % 128 == 0 && src0->ne[3] == 1 &&
+        src1->ne[2] > min_tokens && src0->ne[0] % 64 == 0 && src0->ne[1] % 128 == 0 && src0->ne[3] == 1 &&
         ggml_is_contiguous(src0) && src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float);
 }
 
@@ -440,8 +507,12 @@ bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor 
     const int64_t sc_rows_max = n_pairs + 127 * E;
     const size_t  sc_bytes    = sc_rows_max * kb16;
 
+    // split layout: the values are used in place, only the scales are swizzled
+    const bool split = ggml_cuda_nvfp4_split_tensor(src0);
+
     ggml_cuda_pool & pool = ctx.pool();
-    ggml_cuda_pool_alloc<uint8_t> w_q(pool, E * N * K / 2);
+    ggml_cuda_pool_alloc<uint8_t> w_q(pool);
+    uint8_t * w_q_ptr = split ? (uint8_t *) src0->data : w_q.alloc(E * N * K / 2);
     ggml_cuda_pool_alloc<uint8_t> w_s(pool, E * N * kb16);
     ggml_cuda_pool_alloc<nv_bfloat16> y(pool, n_pairs * N);
     ggml_cuda_pool_alloc<int64_t> meta_d(pool, 14 * E);
@@ -490,7 +561,7 @@ bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor 
         k_nvfp4_lt_count<<<nbp, 256, 0, stream>>>((const char *) ids->data, counts, n_used, ids->nb[0], ids->nb[1], n_pairs, Ei);
     }
     k_nvfp4_lt_setup<<<1, NVFP4_LT_SETUP_THREADS, 0, stream>>>(counts, row_off, sc_off_d, meta_d.ptr, Ei, N, K,
-        w_q.ptr, w_s.ptr, x_q, x_s, y.ptr);
+        w_q_ptr, w_s.ptr, x_q, x_s, y.ptr);
     if (!hit) {
         k_nvfp4_lt_place<<<nbp, 256, 0, stream>>>((const char *) ids->data, row_off, sc_off_d, cursor, pairs_d, inv_p.ptr, n_used, ids->nb[0], ids->nb[1],
             n_pairs, Ei, src1->nb[1], src1->nb[2], src1->ne[1], dst->nb[1], dst->nb[2]);
@@ -499,8 +570,14 @@ bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor 
 
     {
         const int64_t nkb = K / QK_NVFP4;
-        k_nvfp4_lt_repack_weights<<<dim3((nkb + 3) / 4, N / 128, E), 512, 0, stream>>>(
-            (const char *) src0->data, counts, w_q.ptr, w_s.ptr, N, K, src0->nb[1], src0->nb[2]);
+        const dim3 grid((nkb + 3) / 4, N / 128, E);
+        if (split) {
+            k_nvfp4_lt_swizzle_scales<<<dim3(N / 128, E), 256, 0, stream>>>(
+                (const uint32_t *) ((const char *) src0->data + E * N * nkb * (QK_NVFP4 / 2)), counts, (uint32_t *) w_s.ptr, N, (int) nkb);
+        } else {
+            k_nvfp4_lt_repack_weights<<<grid, 512, 0, stream>>>(
+                (const char *) src0->data, counts, w_q.ptr, w_s.ptr, N, K, src0->nb[1], src0->nb[2]);
+        }
         CUDA_CHECK(cudaGetLastError());
     }
     if (!hit) {
@@ -590,6 +667,8 @@ bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor 
 
 #else
 
+void ggml_cuda_nvfp4_split_convert(const void *, void *, int64_t, cudaStream_t) { GGML_ABORT("not supported"); }
+void ggml_cuda_nvfp4_split_unconvert(const void *, void *, int64_t, cudaStream_t) { GGML_ABORT("not supported"); }
 bool ggml_cuda_mul_mat_id_nvfp4_lt_applicable(const ggml_tensor *, int) { return false; }
 bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context &, ggml_tensor *, const ggml_cuda_nvfp4_lt_epilogue *) { return false; }
 void ggml_cuda_mul_mat_id_nvfp4_lt_graph_begin(ggml_backend_cuda_context &, const ggml_cgraph *) {}

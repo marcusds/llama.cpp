@@ -66,6 +66,17 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
     }
 }
 
+template <ggml_type type, bool split>
+static __device__ __forceinline__ float mmvq_vec_dot(
+        const void * vx, const block_q8_1 * y, const int kbx, const int kqs, const uint64_t split_nb) {
+    if constexpr (split) {
+        return vec_dot_nvfp4_split_q8_1(vx, y, kbx, kqs, split_nb);
+    } else {
+        GGML_UNUSED(split_nb);
+        return get_vec_dot_q_cuda(type)(vx, y, kbx, kqs);
+    }
+}
+
 static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:    return VDR_Q1_0_Q8_1_MMVQ;
@@ -645,7 +656,6 @@ static __global__ void mul_mat_vec_q(
     constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
     const     int row0 = rows_per_cuda_block*blockIdx.x;
@@ -653,6 +663,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
 
     const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
+    const uint64_t split_nb = shared_expert ? 0 : fusion.nvfp4_split_nb; // the shared expert is in the ggml layout
     const uint32_t channel_dst = shared_expert ? 0 : blockIdx.y;
     if (shared_expert) {
         vx = fusion.shared_up;
@@ -745,47 +756,60 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
-    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+    // the weight layout is chosen once per kernel, not per block (NVFP4 split layout, see mmid-nvfp4-lt.cuh)
+    const auto k_loop = [&](auto split_c) {
+        constexpr bool split = decltype(split_c)::value;
+        for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
-        // x block quant index when casting the quants to int
-        const int kqs = vdr * (tid % (qi/vdr));
+            // x block quant index when casting the quants to int
+            const int kqs = vdr * (tid % (qi/vdr));
 
-#if __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
-        // start the next iterations' weight loads early
-        if constexpr (mmvq_should_prefetch(type)) {
-            // loop iterations, not blocks; q3_K and q6_K keep the distance in blocks they had with vdr 1
-            constexpr int pf_dist = type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q6_K ? 1 : 2;
-            const int kbx_pf = kbx + pf_dist*blocks_per_iter;
-            if (kbx_pf < blocks_per_row_x) {
-#pragma unroll
+    #if __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+            // start the next iterations' weight loads early
+            if constexpr (mmvq_should_prefetch(type)) {
+                // loop iterations, not blocks; q3_K and q6_K keep the distance in blocks they had with vdr 1
+                constexpr int pf_dist = type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q6_K ? 1 : 2;
+                const int kbx_pf = kbx + pf_dist*blocks_per_iter;
+                if (kbx_pf < blocks_per_row_x) {
+    #pragma unroll
+                    for (int i = 0; i < rows_per_cuda_block; ++i) {
+                        const size_t off = (size_t)(kbx_offset + i*stride_row_x + kbx_pf) * ggml_cuda_type_traits<type>::bs;
+                        mmvq_prefetch_l2((const char *) vx + off);
+                        if constexpr (has_fusion) {
+                            if (use_gate) {
+                                mmvq_prefetch_l2((const char *) vgate + off);
+                            }
+                        }
+                    }
+                }
+            }
+    #endif
+
+    #pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+    #pragma unroll
                 for (int i = 0; i < rows_per_cuda_block; ++i) {
-                    const size_t off = (size_t)(kbx_offset + i*stride_row_x + kbx_pf) * ggml_cuda_type_traits<type>::bs;
-                    mmvq_prefetch_l2((const char *) vx + off);
+                    tmp[j][i] += mmvq_vec_dot<type, split>(
+                        vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs, split_nb);
                     if constexpr (has_fusion) {
                         if (use_gate) {
-                            mmvq_prefetch_l2((const char *) vgate + off);
+                            tmp_gate[j][i] += mmvq_vec_dot<type, split>(
+                                vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs, split_nb);
                         }
                     }
                 }
             }
         }
-#endif
-
-#pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
-#pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
-                if constexpr (has_fusion) {
-                    if (use_gate) {
-                        tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
-                    }
-                }
-            }
+    };
+    if constexpr (type == GGML_TYPE_NVFP4) {
+        if (split_nb != 0) {
+            k_loop(std::true_type{});
+        } else {
+            k_loop(std::false_type{});
         }
+    } else {
+        k_loop(std::false_type{});
     }
 
     __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
@@ -901,9 +925,9 @@ static __global__ void mul_mat_vec_q_moe(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
-    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     const bool shared_expert = has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
+    const uint64_t split_nb = shared_expert ? 0 : fusion.nvfp4_split_nb; // the shared expert is in the ggml layout
     if (shared_expert) {
         vx = fusion.shared_up;
         dst = fusion.shared_dst;
@@ -955,19 +979,32 @@ static __global__ void mul_mat_vec_q_moe(
     float tmp[c_rows_per_block] = {0.0f};
     float tmp_gate[c_rows_per_block] = {0.0f};
 
-    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
-        const int kby = kbx * (qk/QK8_1);
-        const int kqs = vdr * (threadIdx.x % (qi/vdr));
+    // the weight layout is chosen once per kernel, not per block (NVFP4 split layout, see mmid-nvfp4-lt.cuh)
+    const auto k_loop = [&](auto split_c) {
+        constexpr bool split = decltype(split_c)::value;
+        for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1);
+            const int kqs = vdr * (threadIdx.x % (qi/vdr));
 
-#pragma unroll
-        for (int i = 0; i < c_rows_per_block; ++i) {
-            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
-            if constexpr (has_fusion) {
-                if (use_gate) {
-                    tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+    #pragma unroll
+            for (int i = 0; i < c_rows_per_block; ++i) {
+                tmp[i] += mmvq_vec_dot<type, split>(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs, split_nb);
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        tmp_gate[i] += mmvq_vec_dot<type, split>(vgate, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs, split_nb);
+                    }
                 }
             }
         }
+    };
+    if constexpr (type == GGML_TYPE_NVFP4) {
+        if (split_nb != 0) {
+            k_loop(std::true_type{});
+        } else {
+            k_loop(std::false_type{});
+        }
+    } else {
+        k_loop(std::false_type{});
     }
 
     ggml_cuda_pdl_lc();
@@ -1484,6 +1521,10 @@ void ggml_cuda_mul_mat_vec_q(
     float         *  dst_d =       (float         *)  dst->data;
 
     ggml_cuda_mm_fusion_args_device fusion_local{};
+    if (ggml_cuda_nvfp4_split_tensor(src0)) {
+        GGML_ASSERT(ids);
+        fusion_local.nvfp4_split_nb = ggml_nelements(src0) / QK_NVFP4;
+    }
 
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -1518,6 +1559,7 @@ void ggml_cuda_mul_mat_vec_q(
         }
         if (fusion->gate) {
             GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
+            GGML_ASSERT(ggml_cuda_nvfp4_split_tensor(fusion->gate) == ggml_cuda_nvfp4_split_tensor(src0));
             fusion_local.gate = fusion->gate->data;
         }
         if (fusion->gate_bias) {
