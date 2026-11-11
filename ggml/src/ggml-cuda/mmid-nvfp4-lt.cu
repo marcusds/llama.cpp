@@ -30,16 +30,11 @@ static __device__ __forceinline__ int64_t nvfp4_lt_scale_off(const int row, cons
     return ((int64_t) (row / 128) * ncol_tiles + col / 4) * 512 + (row % 32) * 16 + ((row % 128) / 32) * 4 + col % 4;
 }
 
-// 8 ggml bytes (value j in the low, j+8 in the high nibble of byte j) -> cuBLAS order (2i low, 2i+1 high)
-static __device__ __forceinline__ uint2 nvfp4_lt_shuffle(const uint32_t a, const uint32_t b) {
-    const uint32_t la = a & 0x0F0F0F0Fu, lb = b & 0x0F0F0F0Fu;
-    const uint32_t ha = (a >> 4) & 0x0F0F0F0Fu, hb = (b >> 4) & 0x0F0F0F0Fu;
-    // the even bytes of x | (x >> 4) hold the nibble pairs
-    return make_uint2(__byte_perm(la | (la >> 4), lb | (lb >> 4), 0x6420), __byte_perm(ha | (ha >> 4), hb | (hb >> 4), 0x6420));
-}
-
+// The values keep the ggml nibble order (value j low, j+8 high in byte j of a 16 value sub-block);
+// the activations are packed the same way, so the K order seen by cuBLAS is permuted equally for
+// both operands and the 16 value scale groups stay intact.
 // ggml block: 4 scales then 32 bytes of values; a CUDA block does 128 rows x 4 k-blocks,
-// the scales go through shared memory so each scale tile is written as 512 contiguous bytes
+// the scales go through shared memory so each scale tile is written as 512 contiguous bytes.
 static __global__ void __launch_bounds__(512) k_nvfp4_lt_repack_weights(
         const char * __restrict__ src, const int32_t * __restrict__ counts, uint8_t * __restrict__ dst_q, uint8_t * __restrict__ dst_s,
         const int64_t N, const int64_t K, const size_t nb01, const size_t nb02) {
@@ -61,13 +56,9 @@ static __global__ void __launch_bounds__(512) k_nvfp4_lt_repack_weights(
         for (int j = 0; j < 9; ++j) {
             w[j] = __ldg(p + j);
         }
-        const uint2 o0 = nvfp4_lt_shuffle(w[1], w[2]);
-        const uint2 o1 = nvfp4_lt_shuffle(w[3], w[4]);
-        const uint2 o2 = nvfp4_lt_shuffle(w[5], w[6]);
-        const uint2 o3 = nvfp4_lt_shuffle(w[7], w[8]);
         uint4 * q = (uint4 *) (dst_q + (a * N + n) * (K / 2) + (int64_t) kb * (QK_NVFP4 / 2));
-        q[0] = make_uint4(o0.x, o0.y, o1.x, o1.y);
-        q[1] = make_uint4(o2.x, o2.y, o3.x, o3.y);
+        q[0] = make_uint4(w[1], w[2], w[3], w[4]);
+        q[1] = make_uint4(w[5], w[6], w[7], w[8]);
         // position of row r inside its 128 row scale tile, see nvfp4_lt_scale_off
         sc[kbl][(r % 32) * 4 + r / 32] = w[0];
     }
@@ -134,7 +125,7 @@ static __global__ void k_nvfp4_lt_quantize_act(
         uint64_t o = 0;
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            o |= (uint64_t) (nvfp4_lt_e2m1(v[2*j] * sc_inv) | (nvfp4_lt_e2m1(v[2*j + 1] * sc_inv) << 4)) << (8*j);
+            o |= (uint64_t) (nvfp4_lt_e2m1(v[j] * sc_inv) | (nvfp4_lt_e2m1(v[j + 8] * sc_inv) << 4)) << (8*j);
         }
         *(uint2 *) (dst_q + (int64_t) blockIdx.x * (K / 2) + sb * 8) = make_uint2((uint32_t) o, (uint32_t) (o >> 32));
         dst_s[pr.sc_base + nvfp4_lt_scale_off(pr.row, sb, (int) (K / 64))] = sc.__x;
@@ -177,7 +168,7 @@ static __global__ void __launch_bounds__(NVFP4_LT_QROW_THREADS) k_nvfp4_lt_quant
     const float g_inv = g > 0.0f ? 1.0f / g : 0.0f;
 
     // K % 64 == 0, so the 4 lanes of a sub-block are all in or all out of range
-    uint16_t q[items];
+    uint32_t q[items]; // lanes 0 and 1 of a sub-block: 4 bytes in ggml nibble order
     uint8_t  sc_b[items];
 #pragma unroll
     for (int i = 0; i < items; ++i) {
@@ -188,8 +179,10 @@ static __global__ void __launch_bounds__(NVFP4_LT_QROW_THREADS) k_nvfp4_lt_quant
         const __nv_fp8_e4m3 sc(a / 6.0f);
         const float sc_f   = (float) sc;
         const float sc_inv = sc_f > 0.0f ? 1.0f / sc_f : 0.0f;
-        q[i] = (uint16_t) (nvfp4_lt_e2m1(a0 * sc_inv) | (nvfp4_lt_e2m1(a1 * sc_inv) << 4) |
-                          (nvfp4_lt_e2m1(a2 * sc_inv) << 8) | (nvfp4_lt_e2m1(a3 * sc_inv) << 12));
+        // nibble k of value 4*lane+k goes to bits 8k (lanes 0, 1) or 8k+4 (lanes 2, 3, from the partner lane)
+        const uint32_t nib = (uint32_t) nvfp4_lt_e2m1(a0 * sc_inv) | ((uint32_t) nvfp4_lt_e2m1(a1 * sc_inv) << 8) |
+                            ((uint32_t) nvfp4_lt_e2m1(a2 * sc_inv) << 16) | ((uint32_t) nvfp4_lt_e2m1(a3 * sc_inv) << 24);
+        q[i] = nib | (__shfl_xor_sync(0xFFFFFFFF, nib, 2) << 4);
         sc_b[i] = sc.__x;
     }
 
@@ -200,12 +193,14 @@ static __global__ void __launch_bounds__(NVFP4_LT_QROW_THREADS) k_nvfp4_lt_quant
             continue;
         }
         const nvfp4_lt_pair pr = pairs[d];
-        uint16_t * dq = (uint16_t *) (dst_q + (int64_t) d * (K / 2));
+        uint32_t * dq = (uint32_t *) (dst_q + (int64_t) d * (K / 2));
 #pragma unroll
         for (int i = 0; i < items; ++i) {
             const int idx = threadIdx.x + i * NVFP4_LT_QROW_THREADS;
             if (idx < n4) {
-                dq[idx] = q[i];
+                if (idx % 4 < 2) {
+                    dq[idx / 4 * 2 + idx % 4] = q[i];
+                }
                 if (idx % 4 == 0) {
                     dst_s[pr.sc_base + nvfp4_lt_scale_off(pr.row, idx / 4, ncol_tiles)] = sc_b[i];
                 }
