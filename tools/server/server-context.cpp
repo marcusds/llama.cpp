@@ -1867,6 +1867,28 @@ private:
             }
         }
 
+        // a ubatch needs consecutive seq ids with per-sequence caches (e.g. DSV4): prefer a free slot next to a busy one
+        auto is_busy = [&](int id) { return id >= 0 && id < (int) slots.size() && slots[id].is_processing(); };
+        auto free_slot_next_to_busy = [&]() -> server_slot * {
+            for (server_slot * fs : get_free_slots(slots.size(), -1)) {
+                if (is_busy(fs->id - 1) || is_busy(fs->id + 1)) {
+                    return fs;
+                }
+            }
+            return nullptr;
+        };
+
+        // a slot picked by similarity that is not next to a busy one would split every step while the others run;
+        // take a free slot next to a busy one instead, the prompt cache still provides the common prefix
+        if (ret != nullptr && task.id_slot == -1 && !params_base.kv_unified && prompt_cache &&
+                !is_busy(ret->id - 1) && !is_busy(ret->id + 1)) {
+            if (server_slot * fs = free_slot_next_to_busy()) {
+                SLT_INF(*fs, "selected slot next to a busy one instead of slot %d (similarity)\n", ret->id);
+                ret = fs;
+                update_cache = true;
+            }
+        }
+
         // find an empty slot, or the one that has been least recently used
         if (ret == nullptr) {
             const auto free_slots = get_free_slots(slots.size(), -1);
@@ -1874,13 +1896,8 @@ private:
             if (!free_slots.empty()) {
                 ret = free_slots[0];
 
-                // a ubatch needs consecutive seq ids with per-sequence caches (DSV4): prefer a free slot next to a busy one
-                auto is_busy = [&](int id) { return id >= 0 && id < (int) slots.size() && slots[id].is_processing(); };
-                for (server_slot * fs : free_slots) {
-                    if (is_busy(fs->id - 1) || is_busy(fs->id + 1)) {
-                        ret = fs;
-                        break;
-                    }
+                if (server_slot * fs = free_slot_next_to_busy()) {
+                    ret = fs;
                 }
 
                 SLT_INF(*ret, "selected slot by LRU, n_tokens = %d, t_last = %" PRId64 "\n", ret->prompt.n_tokens(), ret->t_last_used);
