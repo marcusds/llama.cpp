@@ -373,16 +373,45 @@ static __global__ void k_nvfp4_lt_place(const char * __restrict__ ids, const int
     inv[p] = row_off[e] + r;
 }
 
-static __global__ void k_nvfp4_split_convert(const uint32_t * __restrict__ src, uint32_t * __restrict__ dst, const int64_t nb) {
-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= nb) {
-        return;
+// blocks [b0, b0 + n) of a tensor with nb blocks, src points at block b0 in the ggml layout. Tiles of 128
+// blocks are staged in shared memory so that the loads are 16-byte and contiguous (they may read host
+// memory over C2C, at the speed of a plain copy); the tail goes one block per thread
+template <bool aligned>
+static __global__ void __launch_bounds__(256) k_nvfp4_split_convert(
+        const uint32_t * __restrict__ src, uint32_t * __restrict__ dst, const int64_t b0, const int64_t n, const int64_t nb) {
+    __shared__ uint32_t sm[128*9];
+    const int64_t ntile = n / 128;
+    for (int64_t t = blockIdx.x; t < ntile; t += gridDim.x) {
+        const uint32_t * s = src + t*128*9;
+        if constexpr (aligned) {
+            for (int j = threadIdx.x; j < 128*9/4; j += 256) {
+                const uint4 v = ((const uint4 *) s)[j];
+                sm[4*j + 0] = v.x; sm[4*j + 1] = v.y; sm[4*j + 2] = v.z; sm[4*j + 3] = v.w;
+            }
+        } else {
+            for (int j = threadIdx.x; j < 128*9; j += 256) {
+                sm[j] = s[j];
+            }
+        }
+        __syncthreads();
+        const int blk = threadIdx.x / 2;
+        const int h   = threadIdx.x % 2;
+        const uint32_t * p = sm + blk*9 + 1 + 4*h;
+        ((uint4 *) (dst + (b0 + t*128 + blk)*8))[h] = make_uint4(p[0], p[1], p[2], p[3]);
+        if (threadIdx.x < 128) {
+            dst[nb*8 + b0 + t*128 + threadIdx.x] = sm[threadIdx.x*9];
+        }
+        __syncthreads();
     }
-    const uint32_t * p = src + i * 9;
-    uint4 * q = (uint4 *) (dst + i * 8);
-    q[0] = make_uint4(p[1], p[2], p[3], p[4]);
-    q[1] = make_uint4(p[5], p[6], p[7], p[8]);
-    dst[nb * 8 + i] = p[0];
+    if (blockIdx.x == gridDim.x - 1) {
+        for (int64_t i = ntile*128 + threadIdx.x; i < n; i += blockDim.x) {
+            const uint32_t * p = src + i*9;
+            uint4 * q = (uint4 *) (dst + (b0 + i)*8);
+            q[0] = make_uint4(p[1], p[2], p[3], p[4]);
+            q[1] = make_uint4(p[5], p[6], p[7], p[8]);
+            dst[nb*8 + b0 + i] = p[0];
+        }
+    }
 }
 
 static __global__ void k_nvfp4_split_unconvert(const uint32_t * __restrict__ src, uint32_t * __restrict__ dst, const int64_t nb) {
@@ -403,9 +432,23 @@ void ggml_cuda_nvfp4_split_unconvert(const void * src, void * dst, const int64_t
     CUDA_CHECK(cudaGetLastError());
 }
 
-void ggml_cuda_nvfp4_split_convert(const void * src, void * dst, const int64_t nblocks, cudaStream_t stream) {
-    k_nvfp4_split_convert<<<(nblocks + 255) / 256, 256, 0, stream>>>((const uint32_t *) src, (uint32_t *) dst, nblocks);
+void ggml_cuda_nvfp4_split_convert_range(const void * src, void * dst, const int64_t b0, const int64_t n, const int64_t nb, cudaStream_t stream) {
+    GGML_ASSERT(b0 >= 0 && n >= 0 && b0 + n <= nb);
+    if (n == 0) {
+        return;
+    }
+    const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    const int nblocks = (int) std::max<int64_t>(1, std::min<int64_t>(n / 128, 4*nsm));
+    if ((uintptr_t) src % 16 == 0) {
+        k_nvfp4_split_convert<true><<<nblocks, 256, 0, stream>>>((const uint32_t *) src, (uint32_t *) dst, b0, n, nb);
+    } else {
+        k_nvfp4_split_convert<false><<<nblocks, 256, 0, stream>>>((const uint32_t *) src, (uint32_t *) dst, b0, n, nb);
+    }
     CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_nvfp4_split_convert(const void * src, void * dst, const int64_t nblocks, cudaStream_t stream) {
+    ggml_cuda_nvfp4_split_convert_range(src, dst, 0, nblocks, nblocks, stream);
 }
 
 bool ggml_cuda_mul_mat_id_nvfp4_lt_applicable(const ggml_tensor * dst, const int cc) {
@@ -668,6 +711,7 @@ bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context & ctx, ggml_tensor 
 #else
 
 void ggml_cuda_nvfp4_split_convert(const void *, void *, int64_t, cudaStream_t) { GGML_ABORT("not supported"); }
+void ggml_cuda_nvfp4_split_convert_range(const void *, void *, int64_t, int64_t, int64_t, cudaStream_t) { GGML_ABORT("not supported"); }
 void ggml_cuda_nvfp4_split_unconvert(const void *, void *, int64_t, cudaStream_t) { GGML_ABORT("not supported"); }
 bool ggml_cuda_mul_mat_id_nvfp4_lt_applicable(const ggml_tensor *, int) { return false; }
 bool ggml_cuda_mul_mat_id_nvfp4_lt(ggml_backend_cuda_context &, ggml_tensor *, const ggml_cuda_nvfp4_lt_epilogue *) { return false; }

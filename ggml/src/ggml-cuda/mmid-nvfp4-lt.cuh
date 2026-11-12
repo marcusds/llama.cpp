@@ -27,5 +27,8 @@ void ggml_cuda_mul_mat_id_nvfp4_lt_free(ggml_backend_cuda_context & ctx);
 // in block order, then the 4 scale bytes of all blocks; block i of the tensor has its values at
 // 32*i and its scales at 32*nblocks + 4*i. Converts nblocks ggml blocks from src (device) to dst.
 void ggml_cuda_nvfp4_split_convert(const void * src, void * dst, int64_t nblocks, cudaStream_t stream);
+// blocks [b0, b0 + n) of a tensor of nb blocks: src points at block b0 in the ggml layout (device memory or
+// host memory the device can read), dst is the start of the split tensor
+void ggml_cuda_nvfp4_split_convert_range(const void * src, void * dst, int64_t b0, int64_t n, int64_t nb, cudaStream_t stream);
 // the inverse: nblocks blocks in the split layout from src (device) to the ggml layout in dst
 void ggml_cuda_nvfp4_split_unconvert(const void * src, void * dst, int64_t nblocks, cudaStream_t stream);
