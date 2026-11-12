@@ -1464,6 +1464,8 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    void * nvfp4_lt_cache = nullptr; // see mmid-nvfp4-lt.cu
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
@@ -1602,6 +1604,7 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
+    uint64_t nvfp4_split_nb = 0; // != 0: src0 (and gate) in the NVFP4 split layout with this many blocks
 };
 
 struct ggml_cuda_kernel_launch_params {
@@ -1728,3 +1731,6 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
+
+// true if t is in the CUDA NVFP4 split buffer type (values and scales stored apart, see mmid-nvfp4-lt.cuh)
+bool ggml_cuda_nvfp4_split_tensor(const ggml_tensor * t);
