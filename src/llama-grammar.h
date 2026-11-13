@@ -42,6 +42,19 @@ enum llama_gretype {
 
     // inverse token (!<[token-id]>)
     LLAMA_GRETYPE_TOKEN_NOT      = 9,
+
+    // permutation ({| sep : a | b? | c* |}): begin, sep rule ref (if any), pick, members, next
+    // the stack holds the members not used yet below the pick / next marker
+    LLAMA_GRETYPE_PERMUTE            = 10, // value is a llama_grammar_permute_phase
+    LLAMA_GRETYPE_PERMUTE_MEMBER     = 11, // rule id, exactly once
+    LLAMA_GRETYPE_PERMUTE_MEMBER_OPT = 12, // rule id, at most once
+    LLAMA_GRETYPE_PERMUTE_MEMBER_REP = 13, // rule id, any number of times
+};
+
+enum llama_grammar_permute_phase {
+    LLAMA_GRAMMAR_PERMUTE_BEGIN = 0,
+    LLAMA_GRAMMAR_PERMUTE_PICK  = 1, // match one of the members left
+    LLAMA_GRAMMAR_PERMUTE_NEXT  = 2, // after a member: end, or sep and pick
 };
 
 typedef struct llama_grammar_element {
@@ -110,7 +123,14 @@ struct llama_grammar_parser {
             const std::string  & rule_name,
             llama_grammar_rule & rule,
             bool               is_nested,
-            uint32_t           depth = 0);
+            uint32_t           depth = 0,
+            bool               is_permute_member = false);
+
+    const char * parse_permute(
+            const char         * src,
+            const std::string  & rule_name,
+            llama_grammar_rule & rule,
+            uint32_t             depth);
 
     const char * parse_rule(const char * src);
 

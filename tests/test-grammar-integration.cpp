@@ -879,6 +879,22 @@ static void test_failure_left_recursion() {
         empty ::= "blah" | )""";
     assert(test_build_grammar_fails(hardest_str));
 
+    assert(test_build_grammar_fails(R"""(root ::= {| "," : "a" | root "b" |})"""));
+    assert(test_build_grammar_fails(R"""(root ::= {| "a"? | "b"? |} root "c" | "d")"""));
+    assert(test_build_grammar_fails(R"""(
+        root ::= {| sep : empty | "x" |} | "d"
+        sep ::= root "c"
+        empty ::= "e" | )"""));
+
+    for (const char * permute_str : {
+            R"""(root ::= {| "," : "a" | "b"? |} root | "d")""",
+            "root ::= {| sep : \"e\" | \"x\" |} | \"d\"\nsep ::= root \"c\"",
+         }) {
+        llama_grammar * permute_grammar = build_grammar(permute_str);
+        assert(permute_grammar != nullptr);
+        llama_grammar_free_impl(permute_grammar);
+    }
+
     const auto chain = [](int n) {
         std::string s = "root ::= r0\n";
         for (int i = 0; i < n; i++) {
@@ -1284,15 +1300,13 @@ static void test_json_schema() {
             // "By extension, even an empty object is valid"
             R"""({})""",
             R"""({ "number": 1600, "street_name": "Pennsylvania", "street_type": "Avenue" })""",
+            R"""({ "street_name": "Pennsylvania", "number": 1600 })""",
         },
         // Failing strings
         {
             // Change datatype from number to string
             R"""({ "number": "1600", "street_name": "Pennsylvania", "street_type":"Avenue"})""",
-            // Reorder properties
-            R"""({ "street_name": "Pennsylvania", "number": 1600 })""",
-            // Reorder properties
-            R"""({ "number": "1600", "street_name": "Pennsylvania", "street_type":"Avenue"})""",
+            R"""({ "number": 1600, "street_name": "Pennsylvania", "number": 1600 })""",
             // "Additional properties default to false for generation, even though the spec says true.
             R"""({ "number": 1600, "street_name": "Pennsylvania", "street_type":"Avenue", "direction":"NW"})""",
 
@@ -1347,19 +1361,20 @@ static void test_json_schema() {
             // "By default, providing additional properties is valid"
             R"""({ "number": 1600, "street_name": "Pennsylvania", "street_type":"Avenue", "direction":"NW"})""",
             R"""({ "number": 1600, "street_name": "Pennsylvania", "street_type": "Avenue" })""",
+            R"""({ "street_name": "Pennsylvania", "number": 1600, "street_type":"Avenue"})""",
+            R"""({ "direction":"NW", "street_name": "Pennsylvania", "unit": 1, "number": 1600, "zip": "x"})""",
         },
         // Failing strings
         {
             // Change datatype from number to string
             R"""({ "number": "1600", "street_name": "Pennsylvania", "street_type":"Avenue"})""",
-            // Reorder properties
-            R"""({ "street_name": "Pennsylvania", "number": 1600, "street_type":"Avenue"})""",
+            R"""({ "street_name": "Pennsylvania", "direction":"NW", "street_name": "Pennsylvania"})""",
         }
     );
 
     // Additional properties: false
     test_schema(
-        "required + optional props each in original order",
+        "required + optional props in any order",
         // Schema
         R"""({
             "type": "object",
@@ -1378,18 +1393,18 @@ static void test_json_schema() {
             R"""({ "number": 1600, "street_name": "Pennsylvania", "street_type":"Avenue"})""",
             // Spaces are permitted around enum values
             R"""({ "number": 1600, "street_name": "Pennsylvania", "street_type": "Avenue" })""",
+            R"""({ "street_type": "Avenue", "number": 1600 })""",
         },
         // Failing strings
         {
-            // Reorder properties
-            R"""({ "street_type": "Avenue", "number": 1600 })""",
+            R"""({ "street_type": "Avenue", "number": 1600, "street_type": "Avenue" })""",
             // Add "direction"
             R"""({ "number": 1600, "street_name": "Pennsylvania", "street_type": "Avenue", "direction": "NW" })""",
         }
     );
 
     test_schema(
-        "required + optional props each in original order",
+        "required + optional props in any order, each at most once",
         // Schema
         R"""({
             "properties": {
@@ -1406,13 +1421,20 @@ static void test_json_schema() {
             R"""({"b": "foo", "a": "bar"})""",
             R"""({"b":"foo","a":"bar","d":"qux"})""",
             R"""({"b":"foo", "a":"bar", "d":"qux", "c":"baz"})""",
+            R"""({"a": "foo", "b": "bar"})""",
+            R"""({"a":"foo", "b":"bar", "c":"baz", "d":"qux"})""",
+            R"""({"c":"baz", "a":"foo", "d":"qux", "b":"bar"})""",
         },
         // Failing strings
         {
-            R"""({"a": "foo", "b": "bar"})""",
             R"""({"b": "bar"})""",
             R"""({"a": "foo", "c": "baz"})""",
-            R"""({"a":"foo", "b":"bar", "c":"baz", "d":"qux"})""",
+            R"""({"a": "foo", "b": "bar", "a": "foo"})""",
+            R"""({"a": "foo", "c": "baz", "b": "bar", "c": "baz"})""",
+            R"""({"a": "foo" "b": "bar"})""",
+            R"""({"a": "foo",, "b": "bar"})""",
+            R"""({"a": "foo", "b": "bar",})""",
+            R"""({"a": "foo", "b": "bar", "e": "x"})""",
         }
     );
 
@@ -1472,18 +1494,20 @@ static void test_json_schema() {
             R"""({"productId": 1, "productName": "A green door", "price": 12.50})""",
             R"""({"productId": 1, "productName": "A green door", "price": 12.50, "tags": ["home", "green"]})""",
             R"""({"productId": 1, "productName": "A green door", "price": 12.50, "tags": ["home", "green"], "dimensions": {"length": 785, "width": 250.5, "height": -0.359}})""",
+            R"""({"productName": "A green door", "price": 12.50, "productId": 1})""",
+            R"""({"productId": 1, "productName": "A green door", "price": 12.50, "dimensions": {"height": -0.359, "length": 785, "width": 250.5}, "tags": ["home", "green"]})""",
         },
         // Failing strings
         {
             R"""({})""", // Missing all required properties
-            R"""({"productName": "A green door", "price": 12.50, "productId": 1})""", // Out of order properties
             // TODO: The following line should fail, but currently it passes. `exclusiveMinimum` is not supported, as it would likely be too difficult to implement.
             //  Perhaps special checks for minimum and maximum values of 0 could be added (since that's relatively easy to do with grammars), but anything else would likely be too complex.
             // R"""({"productId": 1, "productName": "A green door", "price": -12.50})""",
             R"""({"productId": 1, "productName": "A green door"})""", // Missing required property (price)
             R"""({"productName": "A green door", "price": 12.50})""", // Missing required property (productId)
             R"""({"productId": 1, "productName": "A green door", "price": 12.50, "tags": []})""", // tags is empty, but minItems is 1
-            R"""({"productId": 1, "productName": "A green door", "price": 12.50, "dimensions": {"length": 785, "width": 250.5, "height": -0.359}, "tags": ["home", "green"]})""", // Tags and dimensions are out of order
+            R"""({"productId": 1, "productName": "A green door", "price": 12.50, "dimensions": {"length": 785, "height": -0.359}})""",
+            R"""({"productId": 1, "productName": "A green door", "price": 12.50, "dimensions": {"length": 785, "width": 250.5, "height": -0.359, "width": 250.5}})""",
             // TODO: The following line should fail, but currently it passes. `uniqueItems` is not supported, as it would likely be too difficult to implement.
             // R"""({"productId": 1, "productName": "A green door", "price": 12.50, "tags": ["home", "green", "home"]})""",
         }
@@ -1509,6 +1533,288 @@ static void test_json_schema() {
     );
 }
 
+static bool accepts_rest(llama_grammar * grammar, const std::string & input) {
+    try {
+        llama_grammar_accept_str(*grammar, input);
+    } catch (const std::runtime_error &) {
+        return false;
+    }
+    for (const auto & stack : llama_grammar_get_stacks(grammar)) {
+        if (stack.empty()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void test_permute() {
+    test_grammar(
+        "permutation with a separator",
+        R"""(root ::= "{" {| "," : "a" | "b"? | "c"? |} "}")""",
+        {
+            "{a}",
+            "{a,b,c}",
+            "{a,c,b}",
+            "{b,a,c}",
+            "{b,c,a}",
+            "{c,a,b}",
+            "{c,b,a}",
+            "{b,a}",
+            "{a,c}",
+        },
+        {
+            "{}",
+            "{b}",
+            "{b,c}",
+            "{a,a}",
+            "{a,b,a}",
+            "{c,a,c}",
+            "{a,d}",
+            "{a;b}",
+            "{ab}",
+            "{a,}",
+            "{,a}",
+        });
+
+    test_grammar(
+        "permutation without a separator",
+        R"""(root ::= {| "x" | "yy" | "z" |})""",
+        {
+            "xyyz",
+            "zyyx",
+            "yyzx",
+        },
+        {
+            "xyy",
+            "xyyzx",
+            "xyzyy",
+        });
+
+    test_grammar(
+        "permutation with repeatable members",
+        R"""(root ::= {| "," : "a" | "x"* | "y"? |})""",
+        {
+            "a",
+            "a,y",
+            "y,a",
+            "x,y,a,x",
+            "x,x,a",
+        },
+        {
+            "x",
+            "a,y,a",
+            "y,x",
+            "y,a,y",
+        });
+
+    test_grammar(
+        "nested and repeated permutations",
+        R"""(
+            root ::= {| ", " : "a" | "(" inner ")" |} (";" {| "p" | "q" |}){2}
+            inner ::= {| "," : "x" | "y"? |}
+        )""",
+        {
+            "a, (x);pq;qp",
+            "(y,x), a;qp;qp",
+            "(x,y), a;pq;pq",
+        },
+        {
+            "a, (y);pq;qp",
+            "a, (x,x);pq;qp",
+            "(x), a, (x);pq;qp",
+            "a, (x);pp;qp",
+            "a, (x);pq",
+        });
+
+    {
+        fprintf(stderr, "⚫ Testing permutation clones\n");
+        llama_grammar * grammar = build_grammar(R"""(root ::= "{" {| ", " : "\"a\": 1" | "\"b\": 2" | "\"c\": 3"? |} "}")""");
+        llama_grammar_accept_str(*grammar, R"""({"b": 2, )""");
+        llama_grammar * clone = llama_grammar_clone_impl(*grammar);
+        llama_grammar_free_impl(grammar);
+        llama_grammar * clone2 = llama_grammar_clone_impl(*clone);
+        llama_grammar * clone3 = llama_grammar_clone_impl(*clone);
+        assert(accepts_rest(clone, R"""("c": 3, "a": 1})"""));
+        assert(!accepts_rest(clone2, R"""("b": 2, "a": 1})"""));
+        assert(!accepts_rest(clone3, R"""("c": 3})"""));
+        llama_grammar_free_impl(clone);
+        llama_grammar_free_impl(clone2);
+        llama_grammar_free_impl(clone3);
+        fprintf(stderr, "  ✅︎ Passed\n");
+    }
+
+    {
+        fprintf(stderr, "⚫ Testing permutation candidate rejection\n");
+        llama_grammar * grammar = build_grammar(R"""(root ::= {| "," : "ab" | "c"? |})""");
+        const std::vector<std::pair<std::string, bool>> pieces = {
+            {"ab", true}, {"a", true}, {"c,ab", true}, {"ab,c", true}, {"c,", true},
+            {"ab,ab", false}, {"c,c", false}, {"b", false}, {"abc", false}, {",", false},
+        };
+        std::vector<std::vector<uint32_t>> code_points;
+        llama_grammar_candidates candidates;
+        for (const auto & piece : pieces) {
+            code_points.emplace_back(piece.first.begin(), piece.first.end());
+            code_points.back().push_back(0);
+        }
+        for (size_t i = 0; i < pieces.size(); i++) {
+            candidates.push_back({i, code_points[i].data(), {0, 0}, 0});
+        }
+        std::vector<bool> accepted(pieces.size(), false);
+        for (const auto & stack : llama_grammar_get_stacks(grammar)) {
+            std::vector<bool> rejected(pieces.size(), false);
+            for (const auto & reject : llama_grammar_reject_candidates_for_stack(llama_grammar_get_rules(grammar), stack, candidates)) {
+                rejected[reject.index] = true;
+            }
+            for (size_t i = 0; i < pieces.size(); i++) {
+                accepted[i] = accepted[i] || !rejected[i];
+            }
+        }
+        for (size_t i = 0; i < pieces.size(); i++) {
+            if (accepted[i] != pieces[i].second) {
+                fprintf(stderr, "  ❌ \"%s\" expected %s\n", pieces[i].first.c_str(), pieces[i].second ? "accepted" : "rejected");
+            }
+            assert(accepted[i] == pieces[i].second);
+        }
+        llama_grammar_free_impl(grammar);
+        fprintf(stderr, "  ✅︎ Passed\n");
+    }
+}
+
+static void test_json_schema_any_order() {
+    test_schema(
+        "3 properties in any order, 1 required",
+        R"""({
+            "type": "object",
+            "properties": {"a": {"type": "integer"}, "b": {"type": "string"}, "c": {"type": "boolean"}},
+            "required": ["a"],
+            "additionalProperties": false
+        })""",
+        {
+            R"""({"a": 1, "b": "x", "c": true})""",
+            R"""({"a": 1, "c": true, "b": "x"})""",
+            R"""({"b": "x", "a": 1, "c": true})""",
+            R"""({"b": "x", "c": true, "a": 1})""",
+            R"""({"c": true, "a": 1, "b": "x"})""",
+            R"""({"c": true, "b": "x", "a": 1})""",
+            R"""({"a": 1})""",
+            R"""({"c": true, "a": 1})""",
+        },
+        {
+            R"""({})""",
+            R"""({"b": "x", "c": true})""",
+            R"""({"a": 1, "a": 1})""",
+            R"""({"c": true, "a": 1, "c": true})""",
+            R"""({"a": 1, "d": 1})""",
+            R"""({"a": 1; "b": "x"})""",
+            R"""({"a": 1, "b": 2})""",
+        });
+
+    test_schema(
+        "nested objects in any order",
+        R"""({
+            "type": "object",
+            "properties": {
+                "outer": {"type": "integer"},
+                "inner": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}}, "required": ["x", "y"], "additionalProperties": false}
+            },
+            "required": ["outer", "inner"],
+            "additionalProperties": false
+        })""",
+        {
+            R"""({"inner": {"y": 2, "x": 1}, "outer": 0})""",
+            R"""({"outer": 0, "inner": {"x": 1, "y": 2}})""",
+        },
+        {
+            R"""({"inner": {"y": 2, "y": 1}, "outer": 0})""",
+            R"""({"inner": {"x": 1}, "outer": 0})""",
+            R"""({"inner": {"x": 1, "y": 2}, "inner": {"x": 1, "y": 2}, "outer": 0})""",
+        });
+
+    test_schema(
+        "properties in any order: 14 properties, 2 required, additional allowed",
+        R"""({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"}, "column_type": {"type": "string"}, "drop": {"type": "boolean"},
+                "expr": {"type": "string"}, "dtype": {"type": "string"}, "sampler_type": {"type": "string"},
+                "params": {"type": "object"}, "code_lang": {"type": "string"}, "scores": {"type": "array"},
+                "output_format": {"type": "object"}, "prompt": {"type": "string"}, "model_alias": {"type": "string"},
+                "system_prompt": {"type": "string"}, "extract_reasoning_content": {"type": "boolean"}
+            },
+            "required": ["name", "column_type"],
+            "additionalProperties": true
+        })""",
+        {
+            R"""({"name": "n", "column_type": "expression", "expr": "0", "dtype": "int"})""",
+            R"""({"name": "n", "column_type": "expression", "dtype": "int", "expr": "0"})""",
+            R"""({"column_type": "llm-text", "model_alias": "m", "prompt": "p", "name": "q"})""",
+            R"""({"name": "n", "column_type": "x", "extract_reasoning_content": true, "other": 1})""",
+            R"""({"other": 1, "name": "n", "more": 2, "column_type": "x", "other": 3})""",
+        },
+        {
+            R"""({"name": "n"})""",
+            R"""({"name": "n", "name": "m", "column_type": "x"})""",
+            R"""({"name": "n", "column_type": "x", "prompt": 1})""",
+            R"""({"name": "n", "column_type": "x", "expr": "0", "dtype": "int", "expr": "0"})""",
+            R"""({"name": "n", "column_type": "x",})""",
+            R"""({"name": "n", "column_type": "x", "prompt": "p", "prompt": "p"})""",
+        });
+
+    test_schema(
+        "13 properties, 12 required, any order",
+        R"""({
+            "type": "object",
+            "properties": {"a": {}, "b": {}, "c": {}, "d": {}, "e": {}, "f": {}, "g": {}, "h": {}, "i": {}, "j": {}, "k": {}, "l": {}, "m": {}},
+            "required": ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"]
+        })""",
+        {
+            R"""({"a": 1, "b": 1, "c": 1, "d": 1, "e": 1, "f": 1, "g": 1, "h": 1, "i": 1, "j": 1, "k": 1, "l": 1})""",
+            R"""({"l": 1, "k": 1, "m": 1, "j": 1, "i": 1, "h": 1, "g": 1, "f": 1, "e": 1, "d": 1, "c": 1, "b": 1, "a": 1})""",
+        },
+        {
+            R"""({"a": 1, "b": 1, "c": 1, "d": 1, "e": 1, "f": 1, "g": 1, "h": 1, "i": 1, "j": 1, "k": 1})""",
+            R"""({"m": 1, "a": 1, "b": 1, "c": 1, "d": 1, "e": 1, "f": 1, "g": 1, "h": 1, "i": 1, "j": 1, "k": 1, "l": 1, "m": 1})""",
+            R"""({"j": 1, "j": 1})""",
+        });
+
+    test_schema(
+        "property names that clash with generated rule names",
+        R"""({
+            "type": "object",
+            "properties": {
+                "rest-0": {"type": "object", "properties": {"x": {"type": "integer"}}, "required": ["x"]},
+                "rest-1": {"type": "object", "properties": {"y": {"type": "string"}}, "required": ["y"]},
+                "additional-kv": {"type": "object", "properties": {"z": {"type": "boolean"}}, "required": ["z"]}
+            },
+            "required": ["rest-1"],
+            "additionalProperties": true
+        })""",
+        {
+            R"""({"additional-kv": {"z": true}, "rest-1": {"y": "s"}, "rest-0": {"x": 1}})""",
+            R"""({"other": 1, "rest-0": {"x": 1}, "other": 2, "rest-1": {"y": "s"}})""",
+        },
+        {
+            R"""({"rest-0": {"x": 1}})""",
+            R"""({"rest-1": {"x": 1}})""",
+            R"""({"rest-1": {"y": "s"}, "additional-kv": {"y": "s"}})""",
+            R"""({"rest-1": {"y": "s"}, "rest-1": {"y": "t"}})""",
+        });
+
+    {
+        fprintf(stderr, "⚫ Testing grammar size of a 12 property object\n");
+        std::string properties;
+        for (int i = 0; i < 12; i++) {
+            properties += (i > 0 ? ", \"p" : "\"p") + std::to_string(i) + "\": {\"type\": \"integer\"}";
+        }
+        const std::string grammar = json_schema_to_grammar(json::parse("{\"type\": \"object\", \"properties\": {" + properties + "}, \"required\": [\"p0\", \"p5\"]}"), true);
+        llama_grammar_parser parser;
+        assert(parser.parse(grammar.c_str()));
+        assert(grammar.size() < 1000);
+        assert(parser.rules.size() < 64);
+        fprintf(stderr, "  ✅︎ Passed (%zu bytes, %zu rules)\n", grammar.size(), parser.rules.size());
+    }
+}
+
 int main() {
     fprintf(stdout, "Running grammar integration tests...\n");
     test_simple_grammar();
@@ -1521,6 +1827,8 @@ int main() {
     test_failure_missing_root_symbol();
     test_custom_root_symbol_check();
     test_json_schema();
+    test_permute();
+    test_json_schema_any_order();
     fprintf(stdout, "All tests passed.\n");
     return 0;
 }
