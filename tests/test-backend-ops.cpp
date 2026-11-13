@@ -13409,6 +13409,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t nb : {8, 64, 300}) {
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 1536, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 640));
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 1024, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 160));
+        // window only (n_swa = 128), and a list length that is not a multiple of the 64-key block
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 1024, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 128));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 1024, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 100));
     }
 
     return test_cases;
