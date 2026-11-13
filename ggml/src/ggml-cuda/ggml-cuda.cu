@@ -32,6 +32,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/mmid-nvfp4-lt.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -749,6 +750,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    ggml_cuda_mul_mat_id_nvfp4_lt_free(*this);
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -826,10 +828,30 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+static const ggml_tensor * ggml_cuda_nvfp4_split_copy_base(const ggml_tensor * tensor, size_t & offs);
+static void ggml_cuda_nvfp4_split_write(const ggml_tensor * t, const void * src, size_t offs, size_t size, cudaStream_t stream);
+static const void * ggml_cuda_host_device_ptr(int device, const void * ptr);
+
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    size_t offs = 0;
+    if (const ggml_tensor * base = ggml_cuda_nvfp4_split_copy_base(tensor, offs)) {
+        const void * src = ggml_cuda_host_device_ptr(ctx->device, data);
+        void * tmp = nullptr;
+        if (src == nullptr) {
+            CUDA_CHECK(cudaMalloc(&tmp, size));
+            CUDA_CHECK(cudaMemcpyAsync(tmp, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+            src = tmp;
+        }
+        ggml_cuda_nvfp4_split_write(base, src, offs + offset, size, cudaStreamPerThread);
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        if (tmp != nullptr) {
+            CUDA_CHECK(cudaFree(tmp));
+        }
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -846,6 +868,8 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
+    size_t offs = 0;
+    GGML_ASSERT(ggml_cuda_nvfp4_split_copy_base(tensor, offs) == nullptr);
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
@@ -871,6 +895,8 @@ static void ggml_backend_cuda_buffer_set_tensor_n(ggml_backend_buffer_t buffer, 
         if (sizes[i] == 0) {
             continue;
         }
+        size_t offs = 0;
+        GGML_ASSERT(ggml_cuda_nvfp4_split_copy_base(tensors[i], offs) == nullptr);
         CUDA_CHECK(cudaMemcpyAsync(
             (char *) tensors[i]->data + offsets[i],
             data[i],
@@ -915,6 +941,16 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         // in which case a same-device copy (not a peer copy) is required
         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
         const int dst_physical = ggml_cuda_get_physical_device(dst_ctx->device);
+        size_t offs = 0;
+        if (const ggml_tensor * base = ggml_cuda_nvfp4_split_copy_base(dst, offs)) {
+            if (src_physical != dst_physical) {
+                return false; // through host memory and set_tensor
+            }
+            ggml_cuda_set_device(dst_ctx->device);
+            ggml_cuda_nvfp4_split_write(base, src->data, offs, ggml_nbytes(src), cudaStreamPerThread);
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+            return true;
+        }
         if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         } else {
@@ -1100,6 +1136,200 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     }
 
     return &ggml_backend_cuda_buffer_types[device];
+}
+
+// NVFP4 split buffer type: NVFP4 MoE weights are stored with the values of all blocks first and
+// the scales after them (see mmid-nvfp4-lt.cuh), so the cuBLASLt path uses the values in place.
+// Only the src0 of NVFP4 MUL_MAT_ID ops may live here; the data is written in the ggml layout
+// and converted once all bytes of a tensor have been set.
+
+struct ggml_backend_cuda_nvfp4_split_buffer_context : ggml_backend_cuda_buffer_context {
+    std::mutex mutex;
+    std::unordered_map<const ggml_tensor *, size_t> written; // bytes set so far, until converted
+
+    ggml_backend_cuda_nvfp4_split_buffer_context(int device, void * dev_ptr) : ggml_backend_cuda_buffer_context(device, dev_ptr) {}
+};
+
+static const char * ggml_backend_cuda_nvfp4_split_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
+    return ((ggml_backend_cuda_buffer_type_context *) buft->context)->name.c_str();
+}
+
+static bool ggml_backend_buft_is_cuda_nvfp4_split(ggml_backend_buffer_type_t buft) {
+    return buft->iface.get_name == ggml_backend_cuda_nvfp4_split_buffer_type_get_name;
+}
+
+// the shapes the split layout is used for
+static bool ggml_cuda_nvfp4_split_eligible(const ggml_tensor * t) {
+    return t->type == GGML_TYPE_NVFP4 && t->view_src == nullptr && ggml_is_contiguous(t) &&
+        t->ne[0] % 64 == 0 && t->ne[1] % 128 == 0 && t->ne[3] == 1;
+}
+
+
+static void ggml_backend_cuda_nvfp4_split_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    delete (ggml_backend_cuda_nvfp4_split_buffer_context *) buffer->context;
+}
+
+static void ggml_backend_cuda_nvfp4_split_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    auto * ctx = (ggml_backend_cuda_nvfp4_split_buffer_context *) buffer->context;
+    ggml_backend_cuda_buffer_set_tensor(buffer, tensor, data, offset, size);
+    if (!ggml_cuda_nvfp4_split_eligible(tensor)) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    const size_t nbytes = ggml_nbytes(tensor);
+    size_t & done = ctx->written[tensor];
+    done += size;
+    if (done < nbytes) {
+        return;
+    }
+    ctx->written.erase(tensor);
+
+    // all bytes are set: convert in place through a temporary copy
+    ggml_cuda_set_device(ctx->device);
+    void * tmp = nullptr;
+    CUDA_CHECK(cudaMalloc(&tmp, nbytes));
+    CUDA_CHECK(cudaMemcpyAsync(tmp, tensor->data, nbytes, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+    ggml_cuda_nvfp4_split_convert(tmp, tensor->data, ggml_nelements(tensor) / QK_NVFP4, 0, cudaStreamPerThread);
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    CUDA_CHECK(cudaFree(tmp));
+}
+
+static void ggml_backend_cuda_nvfp4_split_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    auto * ctx = (ggml_backend_cuda_nvfp4_split_buffer_context *) buffer->context;
+    if (!ggml_cuda_nvfp4_split_eligible(tensor)) {
+        ggml_backend_cuda_buffer_get_tensor(buffer, tensor, data, offset, size);
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        GGML_ASSERT(ctx->written.count(tensor) == 0 && "NVFP4 split tensor read before all of it was set");
+    }
+
+    // back to the ggml layout through a temporary copy
+    ggml_cuda_set_device(ctx->device);
+    void * tmp = nullptr;
+    CUDA_CHECK(cudaMalloc(&tmp, ggml_nbytes(tensor)));
+    ggml_cuda_nvfp4_split_unconvert(tensor->data, tmp, ggml_nelements(tensor) / QK_NVFP4, 0, cudaStreamPerThread);
+    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tmp + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    CUDA_CHECK(cudaFree(tmp));
+}
+
+static bool ggml_backend_cuda_nvfp4_split_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    GGML_UNUSED_VARS(buffer, src, dst);
+    return false;
+}
+
+static const ggml_backend_buffer_i ggml_backend_cuda_nvfp4_split_buffer_interface = {
+    /* .free_buffer     = */ ggml_backend_cuda_nvfp4_split_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_cuda_buffer_get_base,
+    /* .init_tensor     = */ ggml_backend_cuda_buffer_init_tensor,
+    /* .memset_tensor   = */ ggml_backend_cuda_buffer_memset_tensor,
+    /* .set_tensor      = */ ggml_backend_cuda_nvfp4_split_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_cuda_nvfp4_split_buffer_get_tensor,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
+    /* .cpy_tensor      = */ ggml_backend_cuda_nvfp4_split_buffer_cpy_tensor,
+    /* .clear           = */ ggml_backend_cuda_buffer_clear,
+    /* .reset           = */ NULL,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
+};
+
+static ggml_backend_buffer_t ggml_backend_cuda_nvfp4_split_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
+
+    ggml_cuda_set_device(buft_ctx->device);
+
+    void * dev_ptr;
+    cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_ERROR("%s: allocating %.2f MiB on device %d: cudaMalloc failed: %s\n", __func__, size / 1024.0 / 1024.0, buft_ctx->device, cudaGetErrorString(err));
+        return nullptr;
+    }
+
+    auto * ctx = new ggml_backend_cuda_nvfp4_split_buffer_context(buft_ctx->device, dev_ptr);
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_nvfp4_split_buffer_interface, ctx, size);
+}
+
+static const ggml_backend_buffer_type_i ggml_backend_cuda_nvfp4_split_buffer_type_interface = {
+    /* .get_name            = */ ggml_backend_cuda_nvfp4_split_buffer_type_get_name,
+    /* .alloc_buffer        = */ ggml_backend_cuda_nvfp4_split_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n      = */ NULL,
+    /* .get_alignment       = */ ggml_backend_cuda_buffer_type_get_alignment,
+    /* .get_max_size        = */ NULL,
+    /* .get_alloc_size      = */ ggml_backend_cuda_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n    = */ NULL,
+    /* .is_host             = */ NULL,
+};
+
+// used with GGML_CUDA_NVFP4_SPLIT=1 on devices where the cuBLASLt NVFP4 MoE path is used
+static bool ggml_cuda_nvfp4_split_enabled(int device) {
+    static const bool env = [] {
+        const char * a = getenv("GGML_CUDA_NVFP4_SPLIT");
+        const char * b = getenv("GGML_CUDA_NVFP4_CUBLASLT");
+        return a != nullptr && atoi(a) != 0 && b != nullptr && atoi(b) != 0;
+    }();
+    const int cc = ggml_cuda_info().devices[device].cc;
+    return env && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= 1000 && cc < 1100;
+}
+
+// The scheduler's device copy of host-resident expert weights (a tensor without op in a compute buffer) is
+// also kept in the split layout: every write into it converts (see ggml_cuda_nvfp4_split_write), so the
+// copy kernel writes the layout and MUL_MAT_ID needs no repack
+static bool ggml_cuda_nvfp4_split_copy(const ggml_tensor * t) {
+    return t->buffer != nullptr && ggml_backend_buffer_is_cuda(t->buffer) && t->op == GGML_OP_NONE &&
+        ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+        ggml_cuda_nvfp4_split_eligible(t) && t->ne[2] > 1 &&
+        ggml_cuda_nvfp4_split_enabled(((ggml_backend_cuda_buffer_context *) t->buffer->context)->device);
+}
+
+bool ggml_cuda_nvfp4_split_tiled(const ggml_tensor * t) {
+    return ggml_cuda_nvfp4_split_copy(t);
+}
+
+bool ggml_cuda_nvfp4_split_tensor(const ggml_tensor * t) {
+    return t->buffer != nullptr && ((ggml_backend_buft_is_cuda_nvfp4_split(t->buffer->buft) && ggml_cuda_nvfp4_split_eligible(t)) ||
+        ggml_cuda_nvfp4_split_copy(t));
+}
+
+// the split copy that tensor (or the tensor it views) is, nullptr if none; offs: the byte offset of tensor in it
+static const ggml_tensor * ggml_cuda_nvfp4_split_copy_base(const ggml_tensor * tensor, size_t & offs) {
+    const ggml_tensor * base = tensor->view_src ? tensor->view_src : tensor;
+    offs = tensor->view_src ? tensor->view_offs : 0;
+    return ggml_cuda_nvfp4_split_copy(base) ? base : nullptr;
+}
+
+// writes size bytes of the ggml layout at byte offset offs of the split tensor t: src is device memory or
+// host memory the device reads; a trailing partial block (copy padding) is dropped
+static void ggml_cuda_nvfp4_split_write(const ggml_tensor * t, const void * src, size_t offs, size_t size, cudaStream_t stream) {
+    GGML_ASSERT(offs % sizeof(block_nvfp4) == 0 && "NVFP4 split copy written at a partial block");
+    const int64_t nb = ggml_nelements(t) / QK_NVFP4;
+    const int64_t b0 = offs / sizeof(block_nvfp4);
+    const int64_t n  = std::min<int64_t>(size / sizeof(block_nvfp4), nb - b0);
+    ggml_cuda_nvfp4_split_convert_range(src, t->data, b0, n, nb, t->ne[0] / QK_NVFP4, stream);
+}
+
+static ggml_backend_buffer_type_t ggml_backend_cuda_nvfp4_split_buffer_type(int device) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    static ggml_backend_buffer_type bufts[GGML_CUDA_MAX_DEVICES];
+    static bool initialized = false;
+    if (!initialized) {
+        for (int i = 0; i < ggml_backend_cuda_get_device_count(); i++) {
+            bufts[i] = {
+                /* .iface    = */ ggml_backend_cuda_nvfp4_split_buffer_type_interface,
+                /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i),
+                /* .context  = */ new ggml_backend_cuda_buffer_type_context{i, GGML_CUDA_NAME + std::to_string(i) + "_NVFP4S"},
+            };
+        }
+        initialized = true;
+    }
+    return &bufts[device];
 }
 
 // Communication context for multi-GPU AllReduce during tensor parallelism.
@@ -2075,6 +2305,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    // the tile order of the split scales is for cuBLASLt only
+    if (ggml_cuda_nvfp4_split_tiled(src0)) {
+        return false;
+    }
+
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
@@ -2255,6 +2490,13 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
     if (use_mmvq || !ggml_cuda_should_use_mmq(x_up->type, cc, ncols, /*n_experts =*/ is_id ? x_up->ne[2] : 0)) {
         return false;
     }
+    // the cuBLASLt NVFP4 MUL_MAT_ID path is faster than the fused MMQ kernel where it applies
+    if (is_id && ggml_cuda_mul_mat_id_nvfp4_lt_applicable(up, cc)) {
+        return false;
+    }
+    if (ggml_cuda_nvfp4_split_tensor(x_up) || ggml_cuda_nvfp4_split_tensor(gate->src[0])) {
+        return false;
+    }
 
     // The fused kernel needs one block per tile (no stream-k split), so only fuse if the tiling is efficient.
     return ggml_cuda_mmq_fusion_is_efficient(x_up->type, ggml_prec_get_src(up, 1), x_up->ne[1], ncols, nchannels, device);
@@ -2327,6 +2569,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return true;
     }
 
+    if (ggml_cuda_mul_mat_id_nvfp4_lt_applicable(dst, cc)) {
+        return true;
+    }
+
     if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
         if (ggml_is_quantized(src0->type)) {
             if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
@@ -2360,6 +2606,17 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+
+    if (ggml_cuda_mul_mat_id_nvfp4_lt_applicable(dst, cc) && ggml_cuda_mul_mat_id_nvfp4_lt(ctx, dst)) {
+        return;
+    }
+    if (ggml_cuda_nvfp4_split_tensor(src0)) {
+        // the split layout is read by MMVQ (up to its batch limit, block order) and by the cuBLASLt path only
+        GGML_ASSERT(!ggml_cuda_nvfp4_split_tiled(src0) && "NVFP4 split tensor (tile order) needs the cuBLASLt path");
+        GGML_ASSERT(ne2 <= get_mmvq_mmid_max_batch(src0->type, cc) && "NVFP4 split tensor needs the cuBLASLt path");
+        ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+        return;
+    }
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -2891,11 +3148,47 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// the device pointer of pinned host memory on a coherent system (e.g. Grace C2C, where the GPU reads host
+// memory through the host page tables at about the copy engine bandwidth or more), nullptr otherwise
+static const void * ggml_cuda_host_device_ptr(int device, const void * ptr) {
+    int ats = 0;
+    if (cudaDeviceGetAttribute(&ats, cudaDevAttrPageableMemoryAccessUsesHostPageTables, device) != cudaSuccess || ats == 0) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    cudaPointerAttributes attr;
+    if (cudaPointerGetAttributes(&attr, ptr) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    return attr.type == cudaMemoryTypeHost ? attr.devicePointer : nullptr;
+}
+
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
+    // NVFP4 split tensors are converted on the host thread once complete (e.g. async model loading)
+    if (ggml_backend_buft_is_cuda_nvfp4_split(buf->buft)) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        ggml_backend_tensor_set(tensor, data, offset, size);
+        return;
+    }
+
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+
+    // expert weights copied for a split: the copy kernel writes the split layout
+    size_t offs = 0;
+    if (const ggml_tensor * base = ggml_cuda_nvfp4_split_copy_base(tensor, offs)) {
+        const void * src = ggml_cuda_host_device_ptr(cuda_ctx->device, data);
+        ggml_cuda_pool_alloc<char> tmp(cuda_ctx->pool());
+        if (src == nullptr) {
+            CUDA_CHECK(cudaMemcpyAsync(tmp.alloc(size), data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+            src = tmp.get();
+        }
+        ggml_cuda_nvfp4_split_write(base, src, offs + offset, size, cuda_ctx->stream());
+        return;
+    }
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -2955,6 +3248,16 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         GGML_LOG_DEBUG("%s: backend and buffer devices do not match\n", __func__);
 #endif // NDEBUG
         return false;
+    }
+
+    size_t offs = 0;
+    if (const ggml_tensor * base = ggml_cuda_nvfp4_split_copy_base(dst, offs)) {
+        if (backend_src != backend_dst) {
+            return false;
+        }
+        ggml_cuda_set_device(cuda_ctx_dst->device);
+        ggml_cuda_nvfp4_split_write(base, src->data, offs, ggml_nbytes(src), cuda_ctx_dst->stream());
+        return true;
     }
 
     if (backend_src != backend_dst) {
@@ -4099,6 +4402,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // NVFP4 down projection on cuBLASLt: the per-expert scale, the router weights and the sum over the used
+    // experts are applied while reading the GEMM output (MUL_MAT_ID, scale RESHAPE/REPEAT/GET_ROWS/MUL, weighted reduction)
+    if (node->op == GGML_OP_MUL_MAT_ID && i + 5 < cgraph->n_nodes &&
+            ggml_cuda_mul_mat_id_nvfp4_lt_applicable(node, ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        const ggml_tensor * scale = ggml_cuda_get_mul_mat_id_scale(cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3],
+            cgraph->nodes[i + 4], node);
+        ggml_cuda_moe_weighted_reduction_match match;
+        if (scale && cgraph->nodes[i + 1]->op == GGML_OP_RESHAPE && cgraph->nodes[i + 2]->op == GGML_OP_REPEAT &&
+                cgraph->nodes[i + 3]->op == GGML_OP_GET_ROWS && cgraph->nodes[i + 4]->op == GGML_OP_MUL &&
+                ggml_cuda_match_moe_weighted_reduction(cgraph, i + 4, match) &&
+                match.experts == node && match.expert_scale == cgraph->nodes[i + 3] && match.dst->ne[0] == node->ne[0]) {
+            const int n_ops = 4 + match.node_count;
+            std::vector<ggml_op> ops(n_ops);
+            for (int j = 0; j < n_ops; ++j) {
+                ops[j] = cgraph->nodes[i + j]->op;
+            }
+            const int out_idx = i + n_ops - 1;
+            if (ggml_can_fuse_subgraph(cgraph, i, n_ops, ops.data(), &out_idx, 1) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, &out_idx, 1)) {
+                ggml_cuda_nvfp4_lt_epilogue epi;
+                epi.expert_scale = (const float *) scale->data;
+                epi.weights      = (const float *) match.weights->data;
+                epi.out          = match.dst->data;
+                if (ggml_cuda_mul_mat_id_nvfp4_lt(*cuda_ctx, node, &epi)) {
+                    return n_ops - 1;
+                }
+            }
+        }
+    }
+
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
@@ -4510,6 +4843,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     continue;
                 }
 
+                // cuBLASLt NVFP4 path: per-expert scale in the gate output, scale and GLU in the up output
+                if (!with_bias && ggml_get_op_params_i32(glu, 1) == 0 &&
+                        ggml_cuda_mul_mat_id_nvfp4_lt_applicable(up_n, ggml_cuda_info().devices[cuda_ctx->device].cc) && ggml_cuda_mul_mat_id_nvfp4_lt_applicable(gate_n, ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+                        ggml_are_same_stride(gate_scale_n, gate_n) && ggml_are_same_stride(glu, up_n) && ggml_are_same_shape(glu, up_n) &&
+                        ggml_are_same_shape(gate_n, up_n) && ggml_are_same_stride(gate_n, up_n)) {
+                    ggml_cuda_nvfp4_lt_epilogue epi_gate;
+                    epi_gate.expert_scale = (const float *) gate_scale->data;
+                    epi_gate.out          = gate_scale_n->data;
+                    ggml_cuda_nvfp4_lt_epilogue epi_up;
+                    epi_up.expert_scale = (const float *) up_scale->data;
+                    epi_up.gate         = (const float *) gate_scale_n->data;
+                    epi_up.glu_op       = ggml_get_glu_op(glu);
+                    epi_up.glu_limit    = ggml_get_op_params_f32(glu, 3);
+                    epi_up.out          = cgraph->nodes[glu_idx]->data;
+                    if (ggml_cuda_mul_mat_id_nvfp4_lt(*cuda_ctx, gate_n, &epi_gate)) {
+                        GGML_ASSERT(ggml_cuda_mul_mat_id_nvfp4_lt(*cuda_ctx, up_n, &epi_up));
+                        fused_mul_mat_vec = true;
+                        fused_node_count  = n_ops;
+                        break;
+                    }
+                }
+
                 const ggml_tensor * up_bias   = with_bias ? get_bias_tensor(up_out_n, up_scale_n, bias_op) : nullptr;
                 const ggml_tensor * gate_bias = with_bias ? get_bias_tensor(gate_out_n, gate_scale_n, bias_op) : nullptr;
 
@@ -4749,6 +5104,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fused_mul_mat_vec = true;
                 fused_node_count  = n_ops;
                 break;
+            }
+
+            // the cuBLASLt NVFP4 MUL_MAT_ID applies the per-expert scale in its output
+            if (op == GGML_OP_MUL_MAT_ID && !with_bias && ggml_is_contiguous(mm_node) && ggml_is_contiguous(out_node) &&
+                    ggml_cuda_mul_mat_id_nvfp4_lt_applicable(mm_node, ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+                ggml_cuda_nvfp4_lt_epilogue epi;
+                epi.expert_scale = (const float *) scale->data;
+                epi.out          = out_node->data;
+                if (ggml_cuda_mul_mat_id_nvfp4_lt(*cuda_ctx, mm_node, &epi)) {
+                    fused_mul_mat_vec = true;
+                    fused_node_count  = n_ops;
+                    break;
+                }
             }
         }
         if (fused_mul_mat_vec) {
@@ -5131,6 +5499,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_mul_mat_id_nvfp4_lt_graph_begin(*cuda_ctx, cgraph);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -5905,6 +6274,17 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
 static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
+    // NVFP4 split tensors: only as the experts of an NVFP4 MUL_MAT_ID (MMVQ or cuBLASLt)
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (op->src[i] && op->src[i]->buffer && ggml_backend_buft_is_cuda_nvfp4_split(op->src[i]->buffer->buft)) {
+            if (op->op != GGML_OP_MUL_MAT_ID || i != 0 || !ggml_cuda_nvfp4_split_eligible(op->src[i]) ||
+                    op->src[1]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 || ggml_get_op_params_i32(op, 3) == GGML_PREC_Q8 ||
+                    ((ggml_backend_cuda_buffer_type_context *) op->src[i]->buffer->buft->context)->device != dev_ctx->device) {
+                return false;
+            }
+        }
+    }
+
     // check if all the sources are allocated on this device
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (op->src[i] && op->src[i]->buffer && ggml_backend_buft_is_cuda(op->src[i]->buffer->buft)) {
@@ -6379,7 +6759,17 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
-    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
+    return ((ggml_backend_buft_is_cuda(buft) || ggml_backend_buft_is_cuda_nvfp4_split(buft)) && buft->device == dev) ||
+        (integrated && ggml_backend_buft_is_cuda_host(buft));
+}
+
+static ggml_backend_buffer_type_t * ggml_backend_cuda_device_get_extra_bufts(ggml_backend_dev_t dev) {
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    static ggml_backend_buffer_type_t bufts[GGML_CUDA_MAX_DEVICES][2] = {};
+    if (ggml_cuda_nvfp4_split_enabled(dev_ctx->device)) {
+        bufts[dev_ctx->device][0] = ggml_backend_cuda_nvfp4_split_buffer_type(dev_ctx->device);
+    }
+    return bufts[dev_ctx->device];
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {
@@ -6555,6 +6945,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
+        return (void *)ggml_backend_cuda_device_get_extra_bufts;
     }
     return nullptr;
 }
