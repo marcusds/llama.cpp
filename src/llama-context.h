@@ -411,6 +411,14 @@ private:
 
     copy_experts_info copy_experts;
 
+    // copy engine upload of the first experts of the next host-weight MoE layer on a second stream,
+    // overlapping compute; LLAMA_EXPERT_PREFETCH_MIB sets the device bank size (0 = off)
+    struct expert_prefetch;
+    std::unique_ptr<expert_prefetch> prefetch;
+    bool prefetch_tried = false;
+
+    expert_prefetch * prefetch_get(ggml_backend_t backend);
+
     // graph reallocations during inference where the backend assignments did not change, split by whether the
     // graph size is the same as the previously scheduled one (unexpected) or different
     int32_t n_reallocs_same = 0;
