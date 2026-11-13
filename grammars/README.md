@@ -67,6 +67,26 @@ Parentheses `()` can be used to group sequences, which allows for embedding alte
 - `{m,n}` repeats the precedent symbol or sequence at between `m` and `n` times (included)
 - `{0,n}` repeats the precedent symbol or sequence at most `n` times (included)
 
+## Permutations
+
+`{| sep : a | b? | c* |}` matches its members in any order, with `sep` between two consecutive members. A member is a sequence, like the body of an alternative:
+
+- `a` must appear exactly once
+- `b?` may appear at most once
+- `c*` may appear any number of times
+
+The `sep :` part is optional: `{| a | b |}` matches `ab` and `ba`. A `?` or `*` at the end of a member always applies to the member; wrap the member in parentheses to apply it to the member's content instead, as in `{| (a*) | b |}`.
+
+```
+# a JSON object with the keys "name" (required) and "age" (optional), in any order
+root ::= "{" space {| "," space : name-kv | age-kv? |} space "}"
+name-kv ::= "\"name\"" space ":" space "\"" [a-z]+ "\""
+age-kv ::= "\"age\"" space ":" space [0-9]+
+space ::= " "?
+```
+
+The members not used yet are kept on the parse stack while the grammar runs, so a permutation of `n` members costs `O(n)` grammar rules, while writing out every order with plain alternatives needs `2^n` rules.
+
 ## Tokens
 
 Tokens allow grammars to match specific tokenizer tokens rather than character sequences. This is useful for constraining outputs based on special tokens (like `<think>` or `</think>`).
@@ -189,13 +209,13 @@ The schema above converts to:
 
 ```
 char ::= [^"\\\x7F\x00-\x1F] | [\\] (["\\bfnrt] | "u" [0-9a-fA-F]{4})
-item ::= "{" space item-name-kv "," space item-age-kv "}" space
-item-age ::= ([0-9] | ([1-8] [0-9] | [9] [0-9]) | "1" ([0-4] [0-9] | [5] "0")) space
+item ::= "{" space {| "," space : item-name-kv | item-age-kv |} space "}"
+item-age ::= ([0-9] | ([1-8] [0-9] | [9] [0-9]) | "1" ([0-4] [0-9] | [5] "0"))
 item-age-kv ::= "\"age\"" space ":" space item-age
-item-name ::= "\"" char{1,100} "\"" space
+item-name ::= "\"" char{1,100} "\""
 item-name-kv ::= "\"name\"" space ":" space item-name
-root ::= "[" space item ("," space item){9,99} "]" space
-space ::= | " " | "\n" [ \t]{0,20}
+root ::= "[" space item ("," space item){9,99} space "]"
+space ::= | " " | "\n"{1,2} [ \t]{0,20}
 ```
 
 </details>
@@ -203,6 +223,7 @@ space ::= | " " | "\n" [ \t]{0,20}
 Here is also a list of known limitations (contributions welcome):
 
 - `additionalProperties` defaults to `false` (produces faster grammars + reduces hallucinations).
+- The properties of an object can come in any order, each at most once (see [Permutations](#permutations)).
 - `"additionalProperties": true` may produce keys that contain unescaped newlines.
 - Unsupported features are skipped silently. It is currently advised to use the command-line Python converter (see above) to see any warnings, and to inspect the resulting grammar / test it w/ [llama-gbnf-validator](../examples/gbnf-validator/gbnf-validator.cpp).
 - Can't mix `properties` w/ `anyOf` / `oneOf` in the same type (https://github.com/ggml-org/llama.cpp/issues/7703)

@@ -255,6 +255,15 @@ static bool is_char_element(llama_grammar_element elem) {
     }
 }
 
+static bool is_permute_member(llama_grammar_element elem) {
+    switch (elem.type) {
+        case LLAMA_GRETYPE_PERMUTE_MEMBER:     return true;
+        case LLAMA_GRETYPE_PERMUTE_MEMBER_OPT: return true;
+        case LLAMA_GRETYPE_PERMUTE_MEMBER_REP: return true;
+        default:                               return false;
+    }
+}
+
 static void print_rule_binary(FILE * file, const llama_grammar_rule & rule) {
     for (auto elem : rule) {
         switch (elem.type) {
@@ -268,11 +277,19 @@ static void print_rule_binary(FILE * file, const llama_grammar_rule & rule) {
             case LLAMA_GRETYPE_CHAR_ANY:       fprintf(file, "CHAR_ANY");       break;
             case LLAMA_GRETYPE_TOKEN:          fprintf(file, "TOKEN");          break;
             case LLAMA_GRETYPE_TOKEN_NOT:      fprintf(file, "TOKEN_NOT");      break;
+            case LLAMA_GRETYPE_PERMUTE:            fprintf(file, "PERMUTE");            break;
+            case LLAMA_GRETYPE_PERMUTE_MEMBER:     fprintf(file, "PERMUTE_MEMBER");     break;
+            case LLAMA_GRETYPE_PERMUTE_MEMBER_OPT: fprintf(file, "PERMUTE_MEMBER_OPT"); break;
+            case LLAMA_GRETYPE_PERMUTE_MEMBER_REP: fprintf(file, "PERMUTE_MEMBER_REP"); break;
         }
         switch (elem.type) {
             case LLAMA_GRETYPE_END:
             case LLAMA_GRETYPE_ALT:
             case LLAMA_GRETYPE_RULE_REF:
+            case LLAMA_GRETYPE_PERMUTE:
+            case LLAMA_GRETYPE_PERMUTE_MEMBER:
+            case LLAMA_GRETYPE_PERMUTE_MEMBER_OPT:
+            case LLAMA_GRETYPE_PERMUTE_MEMBER_REP:
                 fprintf(file, "(%u) ", elem.value);
                 break;
             case LLAMA_GRETYPE_CHAR:
@@ -361,6 +378,23 @@ static void print_rule(
                 fprintf(file, "<[");
                 fprintf(file, "%u", elem.value);
                 fprintf(file, "]> ");
+                break;
+            case LLAMA_GRETYPE_PERMUTE:
+                if (elem.value == LLAMA_GRAMMAR_PERMUTE_BEGIN) {
+                    fprintf(file, "{| ");
+                } else if (elem.value == LLAMA_GRAMMAR_PERMUTE_PICK) {
+                    fprintf(file, "%s", rule[i - 1].type == LLAMA_GRETYPE_RULE_REF ? ": " : "");
+                } else {
+                    fprintf(file, "|} ");
+                }
+                break;
+            case LLAMA_GRETYPE_PERMUTE_MEMBER:
+            case LLAMA_GRETYPE_PERMUTE_MEMBER_OPT:
+            case LLAMA_GRETYPE_PERMUTE_MEMBER_REP:
+                fprintf(file, "%s%s %s",
+                    symbol_id_names.at(elem.value).c_str(),
+                    elem.type == LLAMA_GRETYPE_PERMUTE_MEMBER_OPT ? "?" : elem.type == LLAMA_GRETYPE_PERMUTE_MEMBER_REP ? "*" : "",
+                    is_permute_member(rule[i + 1]) ? "| " : "");
                 break;
         }
         if (is_char_element(elem)) {
@@ -461,7 +495,8 @@ const char * llama_grammar_parser::parse_sequence(
         const std::string  & rule_name,
         llama_grammar_rule & rule,
         bool               is_nested,
-        uint32_t           depth) {
+        uint32_t           depth,
+        bool               is_permute_member) {
     size_t last_sym_start = rule.size();
     const char * pos = src;
     uint64_t n_prev_rules = 1;
@@ -615,11 +650,23 @@ const char * llama_grammar_parser::parse_sequence(
                 throw std::runtime_error(std::string("expecting ')' at ") + pos);
             }
             pos = parse_space(pos + 1, is_nested);
+        } else if (pos[0] == '{' && pos[1] == '|') { // permutation
+            if (depth >= GRAMMAR_RECURSIVE_LIMIT) {
+                throw std::runtime_error("grammar recursion depth limit exceeded (max " + std::to_string(GRAMMAR_RECURSIVE_LIMIT) + "), please reduce nesting depth");
+            }
+            uint32_t n_rules_before = symbol_ids.size();
+            last_sym_start = rule.size();
+            pos = parse_permute(pos + 2, rule_name, rule, depth + 1);
+            n_prev_rules = std::max(1u, (uint32_t)symbol_ids.size() - n_rules_before);
+            pos = parse_space(pos, is_nested);
         } else if (*pos == '.') { // any char
             last_sym_start = rule.size();
             n_prev_rules = 1;
             rule.push_back({LLAMA_GRETYPE_CHAR_ANY, 0});
             pos = parse_space(pos + 1, is_nested);
+        } else if (is_permute_member && (*pos == '*' || *pos == '?') && *parse_space(pos + 1, true) == '|') {
+            // member quantifier, handled by parse_permute
+            break;
         } else if (*pos == '*') {
             pos = parse_space(pos + 1, is_nested);
             handle_repetitions(0, -1);
@@ -674,6 +721,65 @@ const char * llama_grammar_parser::parse_sequence(
     return pos;
 }
 
+const char * llama_grammar_parser::parse_permute(
+        const char         * src,
+        const std::string  & rule_name,
+        llama_grammar_rule & rule,
+        uint32_t             depth) {
+    // a part is the separator or a member, a part that is not a single rule ref gets its own rule
+    bool part_empty = false;
+    auto parse_part = [&](const char * pos, llama_gretype type) {
+        llama_grammar_rule part;
+        pos = parse_sequence(pos, rule_name, part, true, depth, true);
+        part_empty = part.empty();
+        uint32_t part_id = 0;
+        if (part.size() == 1 && part[0].type == LLAMA_GRETYPE_RULE_REF) {
+            part_id = part[0].value;
+        } else if (!part_empty) {
+            part_id = generate_symbol_id(rule_name);
+            part.push_back({LLAMA_GRETYPE_END, 0});
+            add_rule(part_id, part);
+        }
+        rule.push_back({type, part_id});
+        return pos;
+    };
+
+    rule.push_back({LLAMA_GRETYPE_PERMUTE, LLAMA_GRAMMAR_PERMUTE_BEGIN});
+    const char * pos = parse_part(parse_space(src, true), LLAMA_GRETYPE_RULE_REF);
+    if (*pos == ':') {
+        if (part_empty) {
+            throw std::runtime_error(std::string("expecting permutation separator at ") + pos);
+        }
+        rule.push_back({LLAMA_GRETYPE_PERMUTE, LLAMA_GRAMMAR_PERMUTE_PICK});
+        pos = parse_part(parse_space(pos + 1, true), LLAMA_GRETYPE_PERMUTE_MEMBER);
+    } else {
+        // no separator, the part is the first member
+        rule.back().type = LLAMA_GRETYPE_PERMUTE_MEMBER;
+        rule.insert(rule.end() - 1, {LLAMA_GRETYPE_PERMUTE, LLAMA_GRAMMAR_PERMUTE_PICK});
+    }
+
+    while (true) {
+        if (part_empty) {
+            throw std::runtime_error(std::string("expecting permutation member at ") + pos);
+        }
+        if (*pos == '?' || *pos == '*') {
+            rule.back().type = *pos == '?' ? LLAMA_GRETYPE_PERMUTE_MEMBER_OPT : LLAMA_GRETYPE_PERMUTE_MEMBER_REP;
+            pos = parse_space(pos + 1, true);
+        }
+        if (pos[0] == '|' && pos[1] == '}') {
+            pos += 2;
+            break;
+        }
+        if (*pos != '|') {
+            throw std::runtime_error(std::string("expecting '|' or '|}' at ") + pos);
+        }
+        pos = parse_part(parse_space(pos + 1, true), LLAMA_GRETYPE_PERMUTE_MEMBER);
+    }
+
+    rule.push_back({LLAMA_GRETYPE_PERMUTE, LLAMA_GRAMMAR_PERMUTE_NEXT});
+    return pos;
+}
+
 const char * llama_grammar_parser::parse_rule(const char * src) {
     const char * name_end = parse_name(src);
     const char * pos      = parse_space(name_end, false);
@@ -710,7 +816,7 @@ bool llama_grammar_parser::parse(const char * src) {
                 throw std::runtime_error("Undefined rule");
             }
             for (const auto & elem : rule) {
-                if (elem.type == LLAMA_GRETYPE_RULE_REF) {
+                if (elem.type == LLAMA_GRETYPE_RULE_REF || is_permute_member(elem)) {
                     // Ensure that the rule at that location exists
                     if (elem.value >= rules.size() || rules[elem.value].empty()) {
                         // Get the name of the rule that is missing
@@ -900,17 +1006,11 @@ static void llama_grammar_advance_stack(
 
         const llama_grammar_element * pos = curr_stack.back();
 
-        switch (pos->type) {
-        case LLAMA_GRETYPE_RULE_REF: {
-            const size_t                  rule_id = static_cast<size_t>(pos->value);
-            const llama_grammar_element * subpos  = rules[rule_id].data();
+        // one new stack per alternate of the rule, on top of base
+        auto push_alternates = [&](const llama_grammar_stack & base, uint32_t rule_id) {
+            const llama_grammar_element * subpos = rules[rule_id].data();
             do {
-                // init new stack without the top (pos)
-                llama_grammar_stack next_stack(curr_stack.begin(), curr_stack.end() - 1);
-                if (!llama_grammar_is_end_of_sequence(pos + 1)) {
-                    // if this rule ref is followed by another element, add that to stack
-                    next_stack.push_back(pos + 1);
-                }
+                llama_grammar_stack next_stack(base);
                 if (!llama_grammar_is_end_of_sequence(subpos)) {
                     // if alternate is nonempty, add to stack
                     next_stack.push_back(subpos);
@@ -927,6 +1027,81 @@ static void llama_grammar_advance_stack(
                     break;
                 }
             } while (true);
+        };
+
+        switch (pos->type) {
+        case LLAMA_GRETYPE_RULE_REF: {
+            // init new stack without the top (pos)
+            llama_grammar_stack next_stack(curr_stack.begin(), curr_stack.end() - 1);
+            if (!llama_grammar_is_end_of_sequence(pos + 1)) {
+                // if this rule ref is followed by another element, add that to stack
+                next_stack.push_back(pos + 1);
+            }
+            push_alternates(next_stack, pos->value);
+            break;
+        }
+        case LLAMA_GRETYPE_PERMUTE: {
+            if (pos->value == LLAMA_GRAMMAR_PERMUTE_BEGIN) {
+                const llama_grammar_element * pick = pos + 1;
+                while (pick->type != LLAMA_GRETYPE_PERMUTE) {
+                    pick++;
+                }
+                const llama_grammar_element * next = pick + 1;
+                while (next->type != LLAMA_GRETYPE_PERMUTE) {
+                    next++;
+                }
+                llama_grammar_stack next_stack(curr_stack.begin(), curr_stack.end() - 1);
+                if (!llama_grammar_is_end_of_sequence(next + 1)) {
+                    next_stack.push_back(next + 1);
+                }
+                // the members not used yet stay on the stack, below the marker
+                llama_grammar_stack empty_stack(next_stack);
+                bool has_required = false;
+                for (const llama_grammar_element * member = pick + 1; member != next; member++) {
+                    has_required = has_required || member->type == LLAMA_GRETYPE_PERMUTE_MEMBER;
+                    next_stack.push_back(member);
+                }
+                if (!has_required) {
+                    todo.push_back(std::move(empty_stack));
+                }
+                next_stack.push_back(pick);
+                todo.push_back(std::move(next_stack));
+                break;
+            }
+            size_t first = curr_stack.size() - 1;
+            bool has_required = false;
+            while (first > 0 && is_permute_member(*curr_stack[first - 1])) {
+                first--;
+                has_required = has_required || curr_stack[first]->type == LLAMA_GRETYPE_PERMUTE_MEMBER;
+            }
+            if (pos->value == LLAMA_GRAMMAR_PERMUTE_PICK) {
+                const llama_grammar_element * next = pos + 1;
+                while (next->type != LLAMA_GRETYPE_PERMUTE) {
+                    next++;
+                }
+                for (size_t i = first; i + 1 < curr_stack.size(); i++) {
+                    llama_grammar_stack next_stack(curr_stack);
+                    next_stack.back() = next;
+                    if (curr_stack[i]->type != LLAMA_GRETYPE_PERMUTE_MEMBER_REP) {
+                        next_stack.erase(next_stack.begin() + i);
+                    }
+                    push_alternates(next_stack, curr_stack[i]->value);
+                }
+            } else {
+                if (!has_required) {
+                    todo.emplace_back(curr_stack.begin(), curr_stack.begin() + first);
+                }
+                if (first + 1 < curr_stack.size()) {
+                    const llama_grammar_element * pick = pos - 1;
+                    while (pick->type != LLAMA_GRETYPE_PERMUTE) {
+                        pick--;
+                    }
+                    // with a separator: its rule ref is followed by the pick marker
+                    llama_grammar_stack next_stack(curr_stack);
+                    next_stack.back() = pick[-1].type == LLAMA_GRETYPE_RULE_REF ? pick - 1 : pick;
+                    todo.push_back(std::move(next_stack));
+                }
+            }
             break;
         }
         case LLAMA_GRETYPE_CHAR:
@@ -970,7 +1145,14 @@ static bool llama_grammar_detect_left_recursion(
     // step but it's more readable as two steps.
     bool at_rule_start = true;
     for (size_t i = 0; i < rule.size(); i++) {
-        if (llama_grammar_is_end_of_sequence(&rule[i])) {
+        if (rule[i].type == LLAMA_GRETYPE_PERMUTE && rule[i].value == LLAMA_GRAMMAR_PERMUTE_BEGIN) {
+            // a permutation with no required member can be empty
+            bool has_required = false;
+            for (i++; rule[i].type != LLAMA_GRETYPE_PERMUTE || rule[i].value != LLAMA_GRAMMAR_PERMUTE_NEXT; i++) {
+                has_required = has_required || rule[i].type == LLAMA_GRETYPE_PERMUTE_MEMBER;
+            }
+            at_rule_start = at_rule_start && !has_required;
+        } else if (llama_grammar_is_end_of_sequence(&rule[i])) {
             if (at_rule_start) {
                 (*rules_may_be_empty)[rule_index] = true;
                 break;
@@ -983,10 +1165,42 @@ static bool llama_grammar_detect_left_recursion(
 
     // Second, recurse into leftmost nonterminals (or next-leftmost as long as the previous nonterminal may
     // be empty)
+    auto detect = [&](uint32_t ref_rule_id) {
+        return llama_grammar_detect_left_recursion(rules, ref_rule_id, rules_visited, rules_in_progress, rules_may_be_empty, depth + 1);
+    };
+
     bool recurse_into_nonterminal = true;
     for (size_t i = 0; i < rule.size(); i++) {
-        if (rule[i].type == LLAMA_GRETYPE_RULE_REF && recurse_into_nonterminal) {
-            if (llama_grammar_detect_left_recursion(rules, (size_t)rule[i].value, rules_visited, rules_in_progress, rules_may_be_empty, depth + 1)) {
+        if (rule[i].type == LLAMA_GRETYPE_PERMUTE) {
+            // any member can come first, and the separator too after a member that may be empty
+            const size_t begin = i;
+            bool   any_member_may_be_empty = false;
+            size_t n_required_not_empty    = 0;
+            size_t n_required              = 0;
+            for (i++; rule[i].type != LLAMA_GRETYPE_PERMUTE || rule[i].value != LLAMA_GRAMMAR_PERMUTE_NEXT; i++) {
+                if (!is_permute_member(rule[i]) || !recurse_into_nonterminal) {
+                    continue;
+                }
+                if (detect(rule[i].value)) {
+                    return true;
+                }
+                const bool may_be_empty = (*rules_may_be_empty)[rule[i].value];
+                any_member_may_be_empty = any_member_may_be_empty || may_be_empty;
+                if (rule[i].type == LLAMA_GRETYPE_PERMUTE_MEMBER) {
+                    n_required++;
+                    n_required_not_empty += may_be_empty ? 0 : 1;
+                }
+            }
+            bool sep_may_be_empty = true;
+            if (recurse_into_nonterminal && rule[begin + 1].type == LLAMA_GRETYPE_RULE_REF) {
+                if (any_member_may_be_empty && detect(rule[begin + 1].value)) {
+                    return true;
+                }
+                sep_may_be_empty = (*rules_may_be_empty)[rule[begin + 1].value];
+            }
+            recurse_into_nonterminal = recurse_into_nonterminal && n_required_not_empty == 0 && (n_required <= 1 || sep_may_be_empty);
+        } else if (rule[i].type == LLAMA_GRETYPE_RULE_REF && recurse_into_nonterminal) {
+            if (detect(rule[i].value)) {
                 return true;
             }
             if (!((*rules_may_be_empty)[(size_t)rule[i].value])) {
@@ -1212,7 +1426,7 @@ struct llama_grammar * llama_grammar_init_impl(
     // Validate that all rule references point to valid rules
     for (size_t i = 0; i < n_rules; i++) {
         for (const auto & elem : vec_rules[i]) {
-            if (elem.type == LLAMA_GRETYPE_RULE_REF) {
+            if (elem.type == LLAMA_GRETYPE_RULE_REF || is_permute_member(elem)) {
                 if (elem.value >= n_rules || vec_rules[elem.value].empty()) {
                     LLAMA_LOG_ERROR("invalid grammar: rule %zu references undefined rule %u\n", i, elem.value);
                     return nullptr;

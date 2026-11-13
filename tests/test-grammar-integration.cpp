@@ -879,6 +879,22 @@ static void test_failure_left_recursion() {
         empty ::= "blah" | )""";
     assert(test_build_grammar_fails(hardest_str));
 
+    assert(test_build_grammar_fails(R"""(root ::= {| "," : "a" | root "b" |})"""));
+    assert(test_build_grammar_fails(R"""(root ::= {| "a"? | "b"? |} root "c" | "d")"""));
+    assert(test_build_grammar_fails(R"""(
+        root ::= {| sep : empty | "x" |} | "d"
+        sep ::= root "c"
+        empty ::= "e" | )"""));
+
+    for (const char * permute_str : {
+            R"""(root ::= {| "," : "a" | "b"? |} root | "d")""",
+            "root ::= {| sep : \"e\" | \"x\" |} | \"d\"\nsep ::= root \"c\"",
+         }) {
+        llama_grammar * permute_grammar = build_grammar(permute_str);
+        assert(permute_grammar != nullptr);
+        llama_grammar_free_impl(permute_grammar);
+    }
+
     const auto chain = [](int n) {
         std::string s = "root ::= r0\n";
         for (int i = 0; i < n; i++) {
@@ -1284,15 +1300,13 @@ static void test_json_schema() {
             // "By extension, even an empty object is valid"
             R"""({})""",
             R"""({ "number": 1600, "street_name": "Pennsylvania", "street_type": "Avenue" })""",
+            R"""({ "street_name": "Pennsylvania", "number": 1600 })""",
         },
         // Failing strings
         {
             // Change datatype from number to string
             R"""({ "number": "1600", "street_name": "Pennsylvania", "street_type":"Avenue"})""",
-            // Reorder properties
-            R"""({ "street_name": "Pennsylvania", "number": 1600 })""",
-            // Reorder properties
-            R"""({ "number": "1600", "street_name": "Pennsylvania", "street_type":"Avenue"})""",
+            R"""({ "number": 1600, "street_name": "Pennsylvania", "number": 1600 })""",
             // "Additional properties default to false for generation, even though the spec says true.
             R"""({ "number": 1600, "street_name": "Pennsylvania", "street_type":"Avenue", "direction":"NW"})""",
 
@@ -1347,19 +1361,20 @@ static void test_json_schema() {
             // "By default, providing additional properties is valid"
             R"""({ "number": 1600, "street_name": "Pennsylvania", "street_type":"Avenue", "direction":"NW"})""",
             R"""({ "number": 1600, "street_name": "Pennsylvania", "street_type": "Avenue" })""",
+            R"""({ "street_name": "Pennsylvania", "number": 1600, "street_type":"Avenue"})""",
+            R"""({ "direction":"NW", "street_name": "Pennsylvania", "unit": 1, "number": 1600, "zip": "x"})""",
         },
         // Failing strings
         {
             // Change datatype from number to string
             R"""({ "number": "1600", "street_name": "Pennsylvania", "street_type":"Avenue"})""",
-            // Reorder properties
-            R"""({ "street_name": "Pennsylvania", "number": 1600, "street_type":"Avenue"})""",
+            R"""({ "street_name": "Pennsylvania", "direction":"NW", "street_name": "Pennsylvania"})""",
         }
     );
 
     // Additional properties: false
     test_schema(
-        "required + optional props each in original order",
+        "required + optional props in any order",
         // Schema
         R"""({
             "type": "object",
@@ -1378,18 +1393,18 @@ static void test_json_schema() {
             R"""({ "number": 1600, "street_name": "Pennsylvania", "street_type":"Avenue"})""",
             // Spaces are permitted around enum values
             R"""({ "number": 1600, "street_name": "Pennsylvania", "street_type": "Avenue" })""",
+            R"""({ "street_type": "Avenue", "number": 1600 })""",
         },
         // Failing strings
         {
-            // Reorder properties
-            R"""({ "street_type": "Avenue", "number": 1600 })""",
+            R"""({ "street_type": "Avenue", "number": 1600, "street_type": "Avenue" })""",
             // Add "direction"
             R"""({ "number": 1600, "street_name": "Pennsylvania", "street_type": "Avenue", "direction": "NW" })""",
         }
     );
 
     test_schema(
-        "required + optional props each in original order",
+        "required + optional props in any order, each at most once",
         // Schema
         R"""({
             "properties": {
@@ -1406,13 +1421,20 @@ static void test_json_schema() {
             R"""({"b": "foo", "a": "bar"})""",
             R"""({"b":"foo","a":"bar","d":"qux"})""",
             R"""({"b":"foo", "a":"bar", "d":"qux", "c":"baz"})""",
+            R"""({"a": "foo", "b": "bar"})""",
+            R"""({"a":"foo", "b":"bar", "c":"baz", "d":"qux"})""",
+            R"""({"c":"baz", "a":"foo", "d":"qux", "b":"bar"})""",
         },
         // Failing strings
         {
-            R"""({"a": "foo", "b": "bar"})""",
             R"""({"b": "bar"})""",
             R"""({"a": "foo", "c": "baz"})""",
-            R"""({"a":"foo", "b":"bar", "c":"baz", "d":"qux"})""",
+            R"""({"a": "foo", "b": "bar", "a": "foo"})""",
+            R"""({"a": "foo", "c": "baz", "b": "bar", "c": "baz"})""",
+            R"""({"a": "foo" "b": "bar"})""",
+            R"""({"a": "foo",, "b": "bar"})""",
+            R"""({"a": "foo", "b": "bar",})""",
+            R"""({"a": "foo", "b": "bar", "e": "x"})""",
         }
     );
 
@@ -1472,18 +1494,20 @@ static void test_json_schema() {
             R"""({"productId": 1, "productName": "A green door", "price": 12.50})""",
             R"""({"productId": 1, "productName": "A green door", "price": 12.50, "tags": ["home", "green"]})""",
             R"""({"productId": 1, "productName": "A green door", "price": 12.50, "tags": ["home", "green"], "dimensions": {"length": 785, "width": 250.5, "height": -0.359}})""",
+            R"""({"productName": "A green door", "price": 12.50, "productId": 1})""",
+            R"""({"productId": 1, "productName": "A green door", "price": 12.50, "dimensions": {"height": -0.359, "length": 785, "width": 250.5}, "tags": ["home", "green"]})""",
         },
         // Failing strings
         {
             R"""({})""", // Missing all required properties
-            R"""({"productName": "A green door", "price": 12.50, "productId": 1})""", // Out of order properties
             // TODO: The following line should fail, but currently it passes. `exclusiveMinimum` is not supported, as it would likely be too difficult to implement.
             //  Perhaps special checks for minimum and maximum values of 0 could be added (since that's relatively easy to do with grammars), but anything else would likely be too complex.
             // R"""({"productId": 1, "productName": "A green door", "price": -12.50})""",
             R"""({"productId": 1, "productName": "A green door"})""", // Missing required property (price)
             R"""({"productName": "A green door", "price": 12.50})""", // Missing required property (productId)
             R"""({"productId": 1, "productName": "A green door", "price": 12.50, "tags": []})""", // tags is empty, but minItems is 1
-            R"""({"productId": 1, "productName": "A green door", "price": 12.50, "dimensions": {"length": 785, "width": 250.5, "height": -0.359}, "tags": ["home", "green"]})""", // Tags and dimensions are out of order
+            R"""({"productId": 1, "productName": "A green door", "price": 12.50, "dimensions": {"length": 785, "height": -0.359}})""",
+            R"""({"productId": 1, "productName": "A green door", "price": 12.50, "dimensions": {"length": 785, "width": 250.5, "height": -0.359, "width": 250.5}})""",
             // TODO: The following line should fail, but currently it passes. `uniqueItems` is not supported, as it would likely be too difficult to implement.
             // R"""({"productId": 1, "productName": "A green door", "price": 12.50, "tags": ["home", "green", "home"]})""",
         }
@@ -1509,6 +1533,97 @@ static void test_json_schema() {
     );
 }
 
+static void test_permute() {
+    test_grammar(
+        "permutation with a separator",
+        R"""(root ::= "{" {| "," : "a" | "b"? | "c"? |} "}")""",
+        {
+            "{a}",
+            "{a,b,c}",
+            "{c,b,a}",
+            "{b,a}",
+            "{a,c}",
+        },
+        {
+            "{}",
+            "{b}",
+            "{a,a}",
+            "{c,a,c}",
+            "{a,d}",
+            "{ab}",
+            "{a,}",
+            "{,a}",
+        });
+
+    test_grammar(
+        "permutation with repeatable members",
+        R"""(root ::= {| "," : "a" | "x"* | "y"? |})""",
+        {
+            "a",
+            "a,y",
+            "y,a",
+            "x,y,a,x",
+            "x,x,a",
+        },
+        {
+            "x",
+            "a,y,a",
+            "y,x",
+            "y,a,y",
+        });
+
+    test_grammar(
+        "nested and repeated permutations",
+        R"""(
+            root ::= {| ", " : "a" | "(" inner ")" |} (";" {| "p" | "q" |}){2}
+            inner ::= {| "," : "x" | "y"? |}
+        )""",
+        {
+            "a, (x);pq;qp",
+            "(y,x), a;qp;qp",
+            "(x,y), a;pq;pq",
+        },
+        {
+            "a, (y);pq;qp",
+            "a, (x,x);pq;qp",
+            "(x), a, (x);pq;qp",
+            "a, (x);pp;qp",
+            "a, (x);pq",
+        });
+}
+
+static void test_json_schema_any_order() {
+    test_schema(
+        "properties in any order: 14 properties, 2 required, additional allowed",
+        R"""({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"}, "column_type": {"type": "string"}, "drop": {"type": "boolean"},
+                "expr": {"type": "string"}, "dtype": {"type": "string"}, "sampler_type": {"type": "string"},
+                "params": {"type": "object"}, "code_lang": {"type": "string"}, "scores": {"type": "array"},
+                "output_format": {"type": "object"}, "prompt": {"type": "string"}, "model_alias": {"type": "string"},
+                "system_prompt": {"type": "string"}, "extract_reasoning_content": {"type": "boolean"}
+            },
+            "required": ["name", "column_type"],
+            "additionalProperties": true
+        })""",
+        {
+            R"""({"name": "n", "column_type": "expression", "expr": "0", "dtype": "int"})""",
+            R"""({"name": "n", "column_type": "expression", "dtype": "int", "expr": "0"})""",
+            R"""({"column_type": "llm-text", "model_alias": "m", "prompt": "p", "name": "q"})""",
+            R"""({"name": "n", "column_type": "x", "extract_reasoning_content": true, "other": 1})""",
+            R"""({"other": 1, "name": "n", "more": 2, "column_type": "x", "other": 3})""",
+        },
+        {
+            R"""({"name": "n"})""",
+            R"""({"name": "n", "name": "m", "column_type": "x"})""",
+            R"""({"name": "n", "column_type": "x", "prompt": 1})""",
+            R"""({"name": "n", "column_type": "x", "expr": "0", "dtype": "int", "expr": "0"})""",
+            R"""({"name": "n", "column_type": "x",})""",
+            R"""({"name": "n", "column_type": "x", "prompt": "p", "prompt": "p"})""",
+        });
+}
+
 int main() {
     fprintf(stdout, "Running grammar integration tests...\n");
     test_simple_grammar();
@@ -1521,6 +1636,8 @@ int main() {
     test_failure_missing_root_symbol();
     test_custom_root_symbol_check();
     test_json_schema();
+    test_permute();
+    test_json_schema_any_order();
     fprintf(stdout, "All tests passed.\n");
     return 0;
 }
