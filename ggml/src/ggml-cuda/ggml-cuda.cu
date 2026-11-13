@@ -1195,7 +1195,7 @@ static void ggml_backend_cuda_nvfp4_split_buffer_set_tensor(ggml_backend_buffer_
     void * tmp = nullptr;
     CUDA_CHECK(cudaMalloc(&tmp, nbytes));
     CUDA_CHECK(cudaMemcpyAsync(tmp, tensor->data, nbytes, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
-    ggml_cuda_nvfp4_split_convert(tmp, tensor->data, ggml_nelements(tensor) / QK_NVFP4, cudaStreamPerThread);
+    ggml_cuda_nvfp4_split_convert(tmp, tensor->data, ggml_nelements(tensor) / QK_NVFP4, 0, cudaStreamPerThread);
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
     CUDA_CHECK(cudaFree(tmp));
 }
@@ -1215,7 +1215,7 @@ static void ggml_backend_cuda_nvfp4_split_buffer_get_tensor(ggml_backend_buffer_
     ggml_cuda_set_device(ctx->device);
     void * tmp = nullptr;
     CUDA_CHECK(cudaMalloc(&tmp, ggml_nbytes(tensor)));
-    ggml_cuda_nvfp4_split_unconvert(tensor->data, tmp, ggml_nelements(tensor) / QK_NVFP4, cudaStreamPerThread);
+    ggml_cuda_nvfp4_split_unconvert(tensor->data, tmp, ggml_nelements(tensor) / QK_NVFP4, 0, cudaStreamPerThread);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tmp + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
     CUDA_CHECK(cudaFree(tmp));
@@ -1292,6 +1292,10 @@ static bool ggml_cuda_nvfp4_split_copy(const ggml_tensor * t) {
         ggml_cuda_nvfp4_split_enabled(((ggml_backend_cuda_buffer_context *) t->buffer->context)->device);
 }
 
+bool ggml_cuda_nvfp4_split_tiled(const ggml_tensor * t) {
+    return ggml_cuda_nvfp4_split_copy(t);
+}
+
 bool ggml_cuda_nvfp4_split_tensor(const ggml_tensor * t) {
     return t->buffer != nullptr && ((ggml_backend_buft_is_cuda_nvfp4_split(t->buffer->buft) && ggml_cuda_nvfp4_split_eligible(t)) ||
         ggml_cuda_nvfp4_split_copy(t));
@@ -1311,7 +1315,7 @@ static void ggml_cuda_nvfp4_split_write(const ggml_tensor * t, const void * src,
     const int64_t nb = ggml_nelements(t) / QK_NVFP4;
     const int64_t b0 = offs / sizeof(block_nvfp4);
     const int64_t n  = std::min<int64_t>(size / sizeof(block_nvfp4), nb - b0);
-    ggml_cuda_nvfp4_split_convert_range(src, t->data, b0, n, nb, stream);
+    ggml_cuda_nvfp4_split_convert_range(src, t->data, b0, n, nb, t->ne[0] / QK_NVFP4, stream);
 }
 
 static ggml_backend_buffer_type_t ggml_backend_cuda_nvfp4_split_buffer_type(int device) {
@@ -2306,6 +2310,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    // the tile order of the split scales is for cuBLASLt only
+    if (ggml_cuda_nvfp4_split_tiled(src0)) {
+        return false;
+    }
+
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
@@ -2605,7 +2614,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         return;
     }
     if (ggml_cuda_nvfp4_split_tensor(src0)) {
-        // the split layout is read by MMVQ (up to its batch limit) and by the cuBLASLt path only
+        // the split layout is read by MMVQ (up to its batch limit, block order) and by the cuBLASLt path only
+        GGML_ASSERT(!ggml_cuda_nvfp4_split_tiled(src0) && "NVFP4 split tensor (tile order) needs the cuBLASLt path");
         GGML_ASSERT(ne2 <= get_mmvq_mmid_max_batch(src0->type, cc) && "NVFP4 split tensor needs the cuBLASLt path");
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
         return;

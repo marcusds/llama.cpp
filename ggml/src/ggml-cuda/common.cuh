@@ -1735,3 +1735,18 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
 
 // true if t is in the CUDA NVFP4 split buffer type (values and scales stored apart, see mmid-nvfp4-lt.cuh)
 bool ggml_cuda_nvfp4_split_tensor(const ggml_tensor * t);
+
+// true if the split tensor t keeps its scales in the tile order (the device copies of host weights, made for
+// large batches): read by cuBLASLt only. The other split tensors keep the block order, which MMVQ reads.
+bool ggml_cuda_nvfp4_split_tiled(const ggml_tensor * t);
+
+// NVFP4 split layout, tile order: the 4 scales (uint32) of block g of a tensor with nkb blocks per row are at
+// this uint32 index after the values, as cuBLAS scale tiles (128 rows x 4 scales per 512 byte tile; the rows
+// of all experts form one matrix since each expert has a multiple of 128 rows). Block order: index g.
+static __host__ __device__ __forceinline__ int64_t nvfp4_split_scale_idx_row(const int64_t row, const int64_t kb, const int64_t nkb) {
+    return ((row >> 7)*nkb + kb)*128 + (row & 31)*4 + ((row >> 5) & 3);
+}
+// nkb == 0: block order
+static __host__ __device__ __forceinline__ int64_t nvfp4_split_scale_idx(const int64_t g, const int64_t nkb) {
+    return nkb == 0 ? g : nvfp4_split_scale_idx_row(g / nkb, g % nkb, nkb);
+}
