@@ -4753,6 +4753,7 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_tokens;
     const bool    identity;
     const bool    gated;
+    const bool    add; // x is the sum of two tensors (routed + shared experts in DeepSeek-V4)
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4760,18 +4761,24 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(n_embd, n_tokens, identity, gated);
+        return VARS_TO_STR5(n_embd, n_tokens, identity, gated, add);
     }
 
     // gated: post = 2*sigmoid(post/hc), as qwen4exp builds it, so backends can fuse the chain
-    bool run_whole_graph() override { return gated; }
+    bool run_whole_graph() override { return gated || add; }
 
-    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false)
-        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated) {}
+    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false, bool add = false)
+        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated), add(add) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
         ggml_set_name(x, "x");
+        if (add) {
+            ggml_tensor * x2 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(x2, "x2");
+            x = ggml_add(ctx, x, x2);
+            ggml_set_name(x, "x_sum");
+        }
 
         ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
         ggml_set_name(residual, "residual");
@@ -10550,6 +10557,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 1));             // DeepSeek-V4-Flash decode
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true, true)); // Qwen4-Exp decode
+    // x is a sum (routed + shared experts): fused into hc_post where supported
+    test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, false, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(4096, 21, false, false, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(4096, 21, true, false, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(4096, 1, false, false, true));
 
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         // blocks with extra cells and scores (k-pool)
@@ -13197,11 +13209,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     // DSV4_HC_POST: n_tokens 1 is decode, 128 and 512 are prompt batches
-    for (int64_t n_tokens : {1, 128, 512}) {
+    for (int64_t n_tokens : {1, 128, 512, 4096}) {
         test_cases.emplace_back(new test_dsv4_hc_post(4096, n_tokens));             // DeepSeek-V4-Flash
         test_cases.emplace_back(new test_dsv4_hc_post(7168, n_tokens));             // DeepSeek-V4-Pro
         test_cases.emplace_back(new test_dsv4_hc_post(2560, n_tokens, true, true)); // Qwen4-Exp, with the post gate chain
         test_cases.emplace_back(new test_dsv4_hc_post(2560, n_tokens, true));       // synthetic, Qwen4-Exp kernel without the gate chain
+        test_cases.emplace_back(new test_dsv4_hc_post(4096, n_tokens, false, false, true)); // DeepSeek-V4-Flash, routed + shared experts summed
     }
 
     // Qwen3.8-Flash-Next pooled indexer prefill.
