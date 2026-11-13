@@ -4868,6 +4868,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // the sum of the routed and shared expert outputs, read directly by hc_post
+    if (node->op == GGML_OP_ADD && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_DSV4_HC_POST) {
+        const ggml_op ops[] = { GGML_OP_ADD, GGML_OP_DSV4_HC_POST };
+        const int out_nodes[] = { i + 1 };
+        if (ggml_cuda_dsv4_hc_post_can_add(node, cgraph->nodes[i + 1]) &&
+                ggml_can_fuse_subgraph(cgraph, i, 2, ops, out_nodes, 1) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
+            ggml_cuda_op_dsv4_hc_post(*cuda_ctx, cgraph->nodes[i + 1], nullptr, nullptr, node);
+            return 1;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST }, { GGML_UNARY_OP_SIGMOID })) {
         ggml_cuda_op_dsv4_hc_post(*cuda_ctx, cgraph->nodes[i + 3], node, cgraph->nodes[i + 2]);
         return 3;
