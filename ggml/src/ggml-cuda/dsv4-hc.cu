@@ -146,6 +146,36 @@ static __global__ void dsv4_hc_pre_f32(
     dst[i0*sd0 + it*sd1] = scale * sum;
 }
 
+// one thread per 4 contiguous elements of a token, HC streams: float4 loads, no 64-bit index division
+template <int HC, bool gated>
+static __global__ void dsv4_hc_pre_f32_vec4(
+        const float * x, const float * weights, float * dst, int n_embd4,
+        int64_t sx1, int64_t sx2, int64_t sw0, int64_t sw1, int64_t sw2, int64_t sd1, float scale) {
+    ggml_cuda_pdl_lc();
+    const int     i  = blockIdx.x*blockDim.x + threadIdx.x;
+    const int64_t it = blockIdx.y;
+    if (i >= n_embd4) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+
+    float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+    for (int ih = 0; ih < HC; ++ih) {
+        const float4 xv = ((const float4 *) (x + ih*sx1 + it*sx2))[i];
+        float4 wv;
+        if constexpr (gated) {
+            const float4 g = ((const float4 *) (weights + ih*sw1 + it*sw2))[i];
+            wv = make_float4(1.0f/(1.0f + expf(-g.x)), 1.0f/(1.0f + expf(-g.y)), 1.0f/(1.0f + expf(-g.z)), 1.0f/(1.0f + expf(-g.w)));
+        } else {
+            const float w = weights[ih*sw0 + it*sw1];
+            wv = make_float4(w, w, w, w);
+        }
+        sum.x += xv.x*wv.x; sum.y += xv.y*wv.y; sum.z += xv.z*wv.z; sum.w += xv.w*wv.w;
+    }
+    ((float4 *) (dst + it*sd1))[i] = make_float4(scale*sum.x, scale*sum.y, scale*sum.z, scale*sum.w);
+}
+
 // gated: post = gate_scale_out*sigmoid(gate_scale_in*post), the fused SCALE -> SIGMOID -> SCALE chain of qwen4exp
 template <bool has_comb, bool gated>
 static __global__ void dsv4_hc_post_f32(
@@ -305,6 +335,23 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     const float scale = ggml_get_op_params_f32(dst, 0);
     const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
+
+    const bool aligned = ((uintptr_t) x->data | (uintptr_t) weights->data | (uintptr_t) dst->data) % 16 == 0 &&
+        (nbx1 | nbx2 | nbd1) % 16 == 0 && (!gated || ((nbw1 | nbw2) % 16 == 0 && nbw0 == sizeof(float)));
+    if (hc == DSV4_HC && nbx0 == sizeof(float) && nbd0 == sizeof(float) && n_embd % 4 == 0 && aligned &&
+            n_tokens <= 65535 && n_embd <= INT_MAX) {
+        const int bs = 256;
+        const int n_embd4 = (int) (n_embd / 4);
+        const dim3 grid_tok((n_embd4 + bs - 1) / bs, n_tokens, 1);
+        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid_tok, dim3(bs, 1, 1), 0, ctx.stream());
+        auto k = gated ? dsv4_hc_pre_f32_vec4<DSV4_HC, true> : dsv4_hc_pre_f32_vec4<DSV4_HC, false>;
+        ggml_cuda_kernel_launch(k, lp,
+                (const float *) x->data, (const float *) weights->data, (float *) dst->data, n_embd4,
+                (int64_t) (nbx1 / sizeof(float)), (int64_t) (nbx2 / sizeof(float)),
+                (int64_t) (nbw0 / sizeof(float)), (int64_t) (nbw1 / sizeof(float)), (int64_t) (nbw2 / sizeof(float)),
+                (int64_t) (nbd1 / sizeof(float)), scale);
+        return;
+    }
 
     const int block_size = 256;
     const int64_t nr = n_embd * n_tokens;
