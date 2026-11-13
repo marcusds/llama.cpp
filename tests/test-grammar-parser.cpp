@@ -18,6 +18,10 @@ static const char * type_str(llama_gretype type) {
         case LLAMA_GRETYPE_RULE_REF: return "LLAMA_GRETYPE_RULE_REF";
         case LLAMA_GRETYPE_ALT: return "LLAMA_GRETYPE_ALT";
         case LLAMA_GRETYPE_END: return "LLAMA_GRETYPE_END";
+        case LLAMA_GRETYPE_PERMUTE: return "LLAMA_GRETYPE_PERMUTE";
+        case LLAMA_GRETYPE_PERMUTE_MEMBER: return "LLAMA_GRETYPE_PERMUTE_MEMBER";
+        case LLAMA_GRETYPE_PERMUTE_MEMBER_OPT: return "LLAMA_GRETYPE_PERMUTE_MEMBER_OPT";
+        case LLAMA_GRETYPE_PERMUTE_MEMBER_REP: return "LLAMA_GRETYPE_PERMUTE_MEMBER_REP";
         default: return "?";
     }
 }
@@ -593,6 +597,51 @@ int main()
         {LLAMA_GRETYPE_TOKEN, 1001},
         {LLAMA_GRETYPE_END, 0},
     });
+
+    verify_parsing(R"""(
+        root ::= "{" {| "," : a | b? | c* |} "}"
+        a ::= "a"
+        b ::= "b"
+        c ::= "c"
+    )""", {
+        {"a", 2},
+        {"b", 3},
+        {"c", 4},
+        {"root", 0},
+        {"root_1", 1},
+    }, {
+        // root (index 0)
+        {LLAMA_GRETYPE_CHAR, '{'},
+        {LLAMA_GRETYPE_PERMUTE, LLAMA_GRAMMAR_PERMUTE_BEGIN},
+        {LLAMA_GRETYPE_RULE_REF, /* root_1 */ 1},
+        {LLAMA_GRETYPE_PERMUTE, LLAMA_GRAMMAR_PERMUTE_PICK},
+        {LLAMA_GRETYPE_PERMUTE_MEMBER, /* a */ 2},
+        {LLAMA_GRETYPE_PERMUTE_MEMBER_OPT, /* b */ 3},
+        {LLAMA_GRETYPE_PERMUTE_MEMBER_REP, /* c */ 4},
+        {LLAMA_GRETYPE_PERMUTE, LLAMA_GRAMMAR_PERMUTE_NEXT},
+        {LLAMA_GRETYPE_CHAR, '}'},
+        {LLAMA_GRETYPE_END, 0},
+        // root_1 (index 1)
+        {LLAMA_GRETYPE_CHAR, ','},
+        {LLAMA_GRETYPE_END, 0},
+        // a (index 2)
+        {LLAMA_GRETYPE_CHAR, 'a'},
+        {LLAMA_GRETYPE_END, 0},
+        // b (index 3)
+        {LLAMA_GRETYPE_CHAR, 'b'},
+        {LLAMA_GRETYPE_END, 0},
+        // c (index 4)
+        {LLAMA_GRETYPE_CHAR, 'c'},
+        {LLAMA_GRETYPE_END, 0},
+    });
+
+    verify_failure(R"""(
+        root ::= {| "a" | "b"
+    )""");
+
+    verify_failure(R"""(
+        root ::= {| "," : |}
+    )""");
 
     return 0;
 }
