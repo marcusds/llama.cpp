@@ -5151,6 +5151,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_nvfp4_lt_epilogue epi;
                 epi.expert_scale = (const float *) scale->data;
                 epi.out          = out_node->data;
+
+                // up projection whose gate was computed before (e.g. in an earlier split, with host experts):
+                // the GLU goes in the output too
+                const int glu_idx = i + n_ops;
+                if (glu_idx < cgraph->n_nodes) {
+                    const ggml_tensor * glu  = cgraph->nodes[glu_idx];
+                    const ggml_tensor * gate = glu->src[0];
+                    ggml_op ops_glu[6];
+                    std::copy(ops, ops + n_ops, ops_glu);
+                    ops_glu[n_ops] = GGML_OP_GLU;
+                    const int glu_out[] = { glu_idx };
+                    if (glu->op == GGML_OP_GLU && glu->src[1] == out_node && gate != nullptr && gate != out_node &&
+                            ggml_get_op_params_i32(glu, 1) == 0 &&
+                            ggml_are_same_shape(glu, out_node) && ggml_is_contiguous(glu) &&
+                            ggml_are_same_shape(gate, out_node) && ggml_is_contiguous(gate) &&
+                            ggml_can_fuse_subgraph(cgraph, i, n_ops + 1, ops_glu, glu_out, 1) &&
+                            ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops + 1, glu_out, 1)) {
+                        epi.gate      = (const float *) gate->data;
+                        epi.glu_op    = ggml_get_glu_op(glu);
+                        epi.glu_limit = ggml_get_op_params_f32(glu, 3);
+                        epi.out       = glu->data;
+                        if (ggml_cuda_mul_mat_id_nvfp4_lt(*cuda_ctx, mm_node, &epi)) {
+                            fused_mul_mat_vec = true;
+                            fused_node_count  = n_ops + 1;
+                            break;
+                        }
+                        epi.gate = nullptr;
+                        epi.out  = out_node->data;
+                    }
+                }
+
                 if (ggml_cuda_mul_mat_id_nvfp4_lt(*cuda_ctx, mm_node, &epi)) {
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
