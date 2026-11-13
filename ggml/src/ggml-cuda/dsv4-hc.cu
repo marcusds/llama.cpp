@@ -236,9 +236,9 @@ static __global__ void dsv4_hc_post_f32(
 // one thread per (element, token) computes all HC outputs: x and the residual are read once instead of HC times
 template <int HC, bool has_comb, bool gated>
 static __global__ void dsv4_hc_post_f32_tok(
-        const float * x, const float * residual, const float * post, const float * comb, float * dst,
+        const float * x, const float * x_add, const float * residual, const float * post, const float * comb, float * dst,
         int n_embd,
-        int64_t sx0, int64_t sx1, int64_t sr0, int64_t sr1, int64_t sr2, int64_t sp0, int64_t sp1,
+        int64_t sx0, int64_t sx1, int64_t sa0, int64_t sa1, int64_t sr0, int64_t sr1, int64_t sr2, int64_t sp0, int64_t sp1,
         int64_t sc0, int64_t sc1, int64_t sc2, int64_t sd0, int64_t sd1, int64_t sd2,
         float gate_scale_in, float gate_scale_out) {
     ggml_cuda_pdl_lc();
@@ -249,7 +249,10 @@ static __global__ void dsv4_hc_post_f32_tok(
     }
     ggml_cuda_pdl_sync();
 
-    const float xv = x[i0*sx0 + it*sx1];
+    float xv = x[i0*sx0 + it*sx1];
+    if (x_add != nullptr) {
+        xv += x_add[i0*sa0 + it*sa1];
+    }
     float r[HC];
 #pragma unroll
     for (int i = 0; i < HC; ++i) {
@@ -369,9 +372,19 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             scale);
 }
 
+bool ggml_cuda_dsv4_hc_post_can_add(const ggml_tensor * add, const ggml_tensor * dst) {
+    const ggml_tensor * residual = dst->src[1];
+    return dst->src[0] == add && add->type == GGML_TYPE_F32 &&
+        add->src[0]->type == GGML_TYPE_F32 && add->src[1]->type == GGML_TYPE_F32 &&
+        ggml_are_same_shape(add->src[0], add) && ggml_are_same_shape(add->src[1], add) &&
+        residual->ne[1] == DSV4_HC && add->ne[1] <= 65535 && add->ne[0] <= INT_MAX && add->ne[2] == 1 && add->ne[3] == 1;
+}
+
 void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
-        const ggml_tensor * gate_scale_in, const ggml_tensor * gate_scale_out) {
-    const ggml_tensor * x        = dst->src[0];
+        const ggml_tensor * gate_scale_in, const ggml_tensor * gate_scale_out, const ggml_tensor * add) {
+    // fused ADD: x = add->src[0] + add->src[1]
+    const ggml_tensor * x        = add ? add->src[0] : dst->src[0];
+    const ggml_tensor * x_add    = add ? add->src[1] : nullptr;
     const ggml_tensor * residual = dst->src[1];
     const ggml_tensor * comb     = dst->src[3];
 
@@ -401,6 +414,7 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const int64_t n_tokens = x->ne[1];
     const int64_t hc       = residual->ne[1];
 
+    GGML_ASSERT(add == nullptr || ggml_cuda_dsv4_hc_post_can_add(add, dst));
     if (hc == DSV4_HC && n_tokens <= 65535 && n_embd <= INT_MAX) {
         const int bs = 256;
         const dim3 grid_tok((n_embd + bs - 1) / bs, n_tokens, 1);
@@ -408,10 +422,11 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
         auto k = comb ? (gated ? dsv4_hc_post_f32_tok<DSV4_HC, true,  true> : dsv4_hc_post_f32_tok<DSV4_HC, true,  false>)
                       : (gated ? dsv4_hc_post_f32_tok<DSV4_HC, false, true> : dsv4_hc_post_f32_tok<DSV4_HC, false, false>);
         ggml_cuda_kernel_launch(k, lp,
-                (const float *) x->data, (const float *) residual->data,
+                (const float *) x->data, x_add ? (const float *) x_add->data : nullptr, (const float *) residual->data,
                 (const float *) post->data, comb ? (const float *) comb->data : nullptr, (float *) dst->data,
                 (int) n_embd,
                 (int64_t) (nbx0 / sizeof(float)), (int64_t) (nbx1 / sizeof(float)),
+                x_add ? (int64_t) (x_add->nb[0] / sizeof(float)) : 0, x_add ? (int64_t) (x_add->nb[1] / sizeof(float)) : 0,
                 (int64_t) (nbr0 / sizeof(float)), (int64_t) (nbr1 / sizeof(float)), (int64_t) (nbr2 / sizeof(float)),
                 (int64_t) (nbp0 / sizeof(float)), (int64_t) (nbp1 / sizeof(float)),
                 (int64_t) (nbc0 / sizeof(float)), (int64_t) (nbc1 / sizeof(float)), (int64_t) (nbc2 / sizeof(float)),
