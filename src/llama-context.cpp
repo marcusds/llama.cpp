@@ -3165,6 +3165,182 @@ ggml_status llama_context::graph_compute(
     return status;
 }
 
+struct llama_context::expert_prefetch {
+    typedef void (*set_dma_t)(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+
+    ggml_backend_t        backend = nullptr; // the compute backend it serves
+    ggml_backend_t        pf      = nullptr; // second instance of the same device, own stream
+    ggml_backend_buffer_t buf     = nullptr;
+    ggml_context_ptr      ctx_bank;
+    ggml_context_ptr      ctx_views;
+    set_dma_t             set_dma = nullptr;
+    ggml_backend_event_t  ev_main = nullptr;
+
+    // host expert tensors of the layers that have them, in layer order
+    std::vector<std::vector<const ggml_tensor *>> layers;
+    std::vector<std::vector<uint8_t>>             last_used; // experts used by the previous large batch, per layer
+    std::unordered_map<const ggml_tensor *, std::pair<int32_t, int32_t>> pos; // tensor -> (layer, part)
+
+    // two banks: the upload for a layer starts once the layer two before it has been copied
+    struct bank_t {
+        ggml_tensor         * t      = nullptr;
+        size_t                size   = 0;
+        ggml_backend_event_t  ev     = nullptr;
+        int32_t               layer  = -1;   // layer whose experts in slot_of are in the bank
+        std::vector<int32_t>  slot_of;       // expert -> bank slot or -1
+        std::vector<size_t>   offs;          // bank offset of each part
+        bool                  waited = true;
+    } banks[2];
+
+    ~expert_prefetch() {
+        for (auto & b : banks) {
+            if (b.ev) { ggml_backend_event_free(b.ev); }
+        }
+        if (ev_main) { ggml_backend_event_free(ev_main); }
+        if (buf)     { ggml_backend_buffer_free(buf); }
+        if (pf)      { ggml_backend_free(pf); }
+    }
+
+    bank_t * find(int32_t il) {
+        for (auto & b : banks) {
+            if (b.layer == il) {
+                return &b;
+            }
+        }
+        return nullptr;
+    }
+
+    // after the copies queued so far on the compute stream, upload the first experts of each part of layer il
+    // into a free bank, else into the one that does not hold layer keep
+    void launch(int32_t il, int32_t keep) {
+        if (find(il) != nullptr) {
+            return;
+        }
+        bank_t * pb = banks[0].layer == -1 ? &banks[0] : banks[1].layer == -1 ? &banks[1] : banks[0].layer == keep ? &banks[1] : &banks[0];
+        bank_t & b = *pb;
+        b.layer = -1;
+        const auto & ts = layers[il];
+        const int64_t n_expert = ts[0]->ne[2];
+        size_t per_expert = 0;
+        for (const ggml_tensor * t : ts) {
+            per_expert += t->nb[2];
+        }
+        const int64_t n_slots = std::min<int64_t>(b.size/per_expert, n_expert);
+        if (n_slots <= 0) {
+            return;
+        }
+        // the experts the previous large batch used first, then the others in order
+        const auto & used = last_used[il];
+        b.slot_of.assign(n_expert, -1);
+        int64_t n = 0;
+        for (int pass = 0; pass < 2 && n < n_slots; ++pass) {
+            for (int64_t e = 0; e < n_expert && n < n_slots; ++e) {
+                const bool u = !used.empty() && used[e];
+                if (b.slot_of[e] < 0 && (pass == 1 || u)) {
+                    b.slot_of[e] = (int32_t) n++;
+                }
+            }
+        }
+        ggml_backend_event_record(ev_main, backend);
+        ggml_backend_event_wait(pf, ev_main);
+        b.offs.clear();
+        size_t off = 0;
+        for (const ggml_tensor * t : ts) {
+            b.offs.push_back(off);
+            // runs of experts in consecutive slots are uploaded together
+            for (int64_t e = 0; e < n_expert; ) {
+                if (b.slot_of[e] < 0) {
+                    e++;
+                    continue;
+                }
+                int64_t r = 1;
+                while (e + r < n_expert && b.slot_of[e + r] == b.slot_of[e] + r) {
+                    r++;
+                }
+                set_dma(pf, b.t, (const char *) t->data + e*t->nb[2], off + (size_t) b.slot_of[e]*t->nb[2], r*t->nb[2]);
+                e += r;
+            }
+            off += n_slots*t->nb[2];
+        }
+        ggml_backend_event_record(b.ev, pf);
+        b.layer  = il;
+        b.waited = false;
+    }
+};
+
+llama_context::expert_prefetch * llama_context::prefetch_get(ggml_backend_t backend) {
+    if (!prefetch_tried) {
+        prefetch_tried = true;
+
+        const char * env = getenv("LLAMA_EXPERT_PREFETCH_MIB");
+        const size_t size = env ? (size_t) std::max(0, atoi(env)) << 20 : 0;
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (size == 0 || dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            return nullptr;
+        }
+        auto set_dma = (expert_prefetch::set_dma_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_set_tensor_async_dma");
+        if (set_dma == nullptr) {
+            return nullptr;
+        }
+
+        auto p = std::make_unique<expert_prefetch>();
+        for (const llama_layer & layer : model.layers) {
+            std::vector<const ggml_tensor *> ts;
+            bool host = true;
+            for (const ggml_tensor * t : { layer.ffn_gate_up_exps, layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps }) {
+                if (t != nullptr) {
+                    host = host && t->buffer && ggml_backend_buffer_is_host(t->buffer) && ggml_is_contiguous(t);
+                    ts.push_back(t);
+                }
+            }
+            if (ts.empty() || !host) {
+                continue;
+            }
+            for (size_t i = 0; i < ts.size(); ++i) {
+                p->pos[ts[i]] = { (int32_t) p->layers.size(), (int32_t) i };
+            }
+            p->layers.push_back(ts);
+        }
+        p->last_used.resize(p->layers.size());
+        if (p->layers.empty()) {
+            return nullptr;
+        }
+
+        p->pf = ggml_backend_dev_init(dev, nullptr);
+        if (p->pf == nullptr) {
+            return nullptr;
+        }
+        p->buf = ggml_backend_alloc_buffer(p->pf, size);
+        if (p->buf == nullptr) {
+            return nullptr;
+        }
+        p->ctx_bank.reset(ggml_init({ 2*ggml_tensor_overhead(), nullptr, true }));
+        p->ctx_views.reset(ggml_init({ 4*ggml_tensor_overhead(), nullptr, true }));
+        const size_t half = size/2 & ~(size_t) 255;
+        for (int i = 0; i < 2; ++i) {
+            auto & b = p->banks[i];
+            b.size = half;
+            b.t    = ggml_new_tensor_1d(p->ctx_bank.get(), GGML_TYPE_I8, half);
+            if (ggml_backend_tensor_alloc(p->buf, b.t, (char *) ggml_backend_buffer_get_base(p->buf) + i*half) != GGML_STATUS_SUCCESS) {
+                return nullptr;
+            }
+            b.ev = ggml_backend_event_new(dev);
+            if (b.ev == nullptr) {
+                return nullptr;
+            }
+        }
+        p->ev_main = ggml_backend_event_new(dev);
+        if (p->ev_main == nullptr) {
+            return nullptr;
+        }
+        p->backend = backend;
+        p->set_dma = set_dma;
+        LLAMA_LOG_INFO("%s: expert prefetch: %zu MiB bank, %zu host MoE layers\n", __func__, size >> 20, p->layers.size());
+        prefetch = std::move(p);
+    }
+    return prefetch && prefetch->backend == backend ? prefetch.get() : nullptr;
+}
+
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
@@ -3209,6 +3385,55 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         st.ids = ids;
     }
 
+    // large batches: the first experts of this layer may already be in the prefetch bank
+    expert_prefetch * pf = ids->ne[1] >= 256 ? lctx->prefetch_get(backend) : nullptr;
+    int32_t pf_il   = -1;
+    int32_t pf_part = -1;
+    if (pf) {
+        const auto it = pf->pos.find(src);
+        if (it == pf->pos.end()) {
+            pf = nullptr;
+        } else {
+            pf_il   = it->second.first;
+            pf_part = it->second.second;
+        }
+    }
+    expert_prefetch::bank_t * pb = pf ? pf->find(pf_il) : nullptr;
+    const bool pf_hit = pb != nullptr;
+    if (pf_hit && !pb->waited) {
+        ggml_backend_event_wait(backend, pb->ev);
+        pb->waited = true;
+    }
+
+    // experts [e0, e1) that are in the bank are copied from it, returns the first expert still to upload
+    // experts [e0, e1): the ones in the bank are copied from it, the others are uploaded
+    auto upload = [&](int64_t e0, int64_t e1) {
+        while (e0 < e1) {
+            const int32_t s0 = pf_hit ? pb->slot_of[e0] : -1;
+            int64_t r = 1;
+            if (s0 >= 0) {
+                while (e0 + r < e1 && pb->slot_of[e0 + r] == s0 + r) {
+                    r++;
+                }
+                ggml_reset(pf->ctx_views.get());
+                // plain tensor over bank memory (no init_tensor: it would zero row padding in the bank)
+                ggml_tensor * sv = ggml_new_tensor_3d(pf->ctx_views.get(), src->type, src->ne[0], src->ne[1], r);
+                GGML_ASSERT(sv->nb[2] == expert_size);
+                sv->buffer = pf->buf;
+                sv->data   = (char *) pb->t->data + pb->offs[pf_part] + (size_t) s0*expert_size;
+                ggml_tensor * dv = ggml_view_3d(pf->ctx_views.get(), dst, dst->ne[0], dst->ne[1], r, dst->nb[1], dst->nb[2], e0*dst->nb[2]);
+                ggml_backend_view_init(dv);
+                ggml_backend_tensor_copy_async(backend, backend, sv, dv);
+            } else {
+                while (e0 + r < e1 && !(pf_hit && pb->slot_of[e0 + r] >= 0)) {
+                    r++;
+                }
+                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + e0*expert_size, e0*expert_size, r*expert_size);
+            }
+            e0 += r;
+        }
+    };
+
     // group consecutive experts and copy them together
     for (int64_t first = 0; first < n_expert; ) {
         if (!st.used[first]) {
@@ -3228,22 +3453,43 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                 e++;
                 continue;
             }
-            if (next < e) {
-                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
-            }
+            upload(next, e);
             e   += n;
             next = e;
         }
 
         // copy a bit extra to ensure there are no NaNs in the padding of the last expert, this is necessary for MMQ in the CUDA backend
-        const size_t offset  = next*expert_size;
         const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
-        const size_t size    = (last + 1 - next)*expert_size + padding;
-        if (size > 0) {
-            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+        if (pf_hit) {
+            upload(next, last + 1);
+            if (padding > 0) {
+                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + (last + 1)*expert_size, (last + 1)*expert_size, padding);
+            }
+        } else {
+            const size_t offset  = next*expert_size;
+            const size_t size    = (last + 1 - next)*expert_size + padding;
+            if (size > 0) {
+                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+            }
         }
 
         first = last + 1;
+    }
+
+    // the last part of a layer: its bank is free, start on the layer two ahead (wrapping to the next ubatch);
+    // the bank of the next layer is kept
+    if (pf && pf_part == (int32_t) pf->layers[pf_il].size() - 1) {
+        const int32_t n_l = (int32_t) pf->layers.size();
+        if (pf_hit) {
+            pb->layer = -1;
+        }
+        auto & lu = pf->last_used[pf_il];
+        lu.assign(st.used.begin(), st.used.end());
+        const int32_t next = (pf_il + 1) % n_l;
+        pf->launch(next, -2);
+        if (n_l > 2) {
+            pf->launch((pf_il + 2) % n_l, next);
+        }
     }
 
     return true;
